@@ -1,5 +1,4 @@
 ---
-aep: 87
 title: "Decoupled Storage Market"
 author: Joseph Chalabi (@chalabi2)
 status: Draft

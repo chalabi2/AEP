@@ -1,6 +1,6 @@
-# AEP-87 Implementation Guide
+# Decoupled Storage Market: Implementation Guide
 
-> Companion to [AEP-87: Decoupled Storage Market](./README.md) (the authoritative specification).
+> Companion to [Decoupled Storage Market](./README.md) (the authoritative specification).
 >
 > This document contains **implementation-specific details only**: protobuf definitions, store layouts, module and
 > provider code changes, the upgrade handler, and the test plan. It does not repeat specification-level content.
@@ -33,7 +33,7 @@ unfinished repeated-prices/deposits redesign. Before anything else:
 2. Revert the repeated-prices redesign back to `main`'s active shapes, so activation is a pure superset of
    v1beta4/v2beta5 and the store migrations are re-serialization only.
 
-The staged dirs become "active shapes + AEP-87 additions", nothing more.
+The staged dirs become "active shapes + storage market additions", nothing more.
 
 **Registration checklist per touched version** (the standard chain-sdk drill): hand-written `codec.go`
 (`RegisterInterfaces`; **zero new Msg types**, so no new `RegisterCustomSignerField` entries), `key.go`, `msgs.go`,
@@ -53,7 +53,7 @@ The complete flow rides existing messages (see the message table in the README).
 
 Fix `node/x/market/hooks/hooks.go:31-34`: `OnEscrowAccountClosed` must `return nil` for any XID that fails
 `DeploymentIDFromEscrowID`, mirroring the payment hook -- hook errors abort `saveAccount` **mid-write** (refunds and
-`store.Set` already applied). AEP-87 adds no new scope and never triggers the bug, but it corrupts state for any future
+`store.Set` already applied). This AEP adds no new scope and never triggers the bug, but it corrupts state for any future
 scope.
 
 **Test obligation:** the foreign-scope hook error is currently masked by `_ = k.ekeeper.AccountClose(...)` at
@@ -142,14 +142,14 @@ After Phase 0 reconciliation, v1beta5 shapes equal main's v1beta4 plus:
 message GroupSpec {
   // name = 1, requirements = 2, resources = 3 unchanged from v1beta4
   akash.deployment.v1.VolumePolicy volume = 4 [(gogoproto.nullable) = true];
-  // nil for every pre-AEP-87 group => migration is re-serialization only
+  // nil for every pre-storage-market group => migration is re-serialization only
 }
 
 message ResourceUnit {
   // resource = 1 (base.resources.v1beta4.Resources -- UNCHANGED base type),
   // count = 2, price = 3 unchanged
   repeated akash.deployment.v1.VolumeRef volumes = 4 [(gogoproto.nullable) = false];
-  // externally-leased volumes this unit's services mount; empty pre-AEP-87
+  // externally-leased volumes this unit's services mount; empty pre-storage-market
 }
 
 message Params {
