@@ -139,7 +139,7 @@ the size can change afterwards, and only by growing through a lease resize, whic
 | Fund / top up                          | `MsgCreateDeployment` deposit, `MsgAccountDeposit` (including AEP-75 grants) |
 | Provider offer                         | `MsgCreateBid`, carrying the order's `volume_policy`        |
 | Accept                                 | `MsgCreateLease`                                            |
-| Close volume (tenant)                  | `MsgCloseDeployment` or `MsgCloseGroup` (routes through reclamation; rejected while attached) |
+| Close volume (tenant)                  | `MsgCloseDeployment` or `MsgCloseGroup` (routes through reclamation; rejected while attached); a volume group cannot be paused or restarted |
 | Move (tenant)                          | `MsgCloseLease` on the volume lease (routes through reclamation, then re-lists) |
 | Move / evict (provider)                | `MsgLeaseStartReclaim` then `MsgCloseBid`                   |
 | Settle / detect exhaustion             | `MsgWithdrawLease`                                          |
@@ -156,11 +156,14 @@ The `vid` is the data's name; the deployment sequence is merely its current mark
 create, adoption included); whether that volume is live, retained, or expired is read from its group and leases. At
 creation time the index enforces:
 
-- A `vid` mapping to a **live** volume (group open or paused) rejects a new volume under the same name.
+- A `vid` mapping to a **live** volume (group open) rejects a new volume under the same name.
 - A `vid` mapping to a **retained** dead volume (closed or unfunded, within its retention window counted from its last
   lease's close time) rejects a new volume under the same name **unless** the new volume's `adopt` reference names
   exactly that dead volume. A mistargeted redeploy can never silently mint an empty volume under an existing data
   identity.
+- When the volume holding the name never had a lease (an adoption closed before it was leased), it holds no data: the
+  rules above apply to the volume it was adopting, so the name stays retained, and a new adoption must name that
+  volume.
 - An expired or absent `vid` permits a fresh create.
 
 The retention window applies to every closed volume whatever its `reclaim` policy: a `delete` volume holds its `vid`
@@ -249,15 +252,20 @@ and re-order), and only then does the volume lease close with its volume reason.
 `max_attachments` (one, in v1) extra lease closures per volume.
 
 **Tenant close routes through reclamation.** Closing a volume is never instantaneous: the first close puts the lease
-into reclamation for its window (at least the chain floor), a close after the deadline completes it, and a repeated
-close before the deadline fails. `MsgCloseLease` on the volume lease is a move (`volume_migrate`): the group stays open
-and re-lists. `MsgCloseDeployment` and `MsgCloseGroup` end the volume (`volume_closed_retain`) and are rejected
-outright while a compute lease is attached -- a mounted database never loses its backing lease to a tenant
-fat-finger; tenants close compute first. Moving an attached volume is allowed: its compute is detached when the window
-ends. (The escrow-exhaustion cascade cannot be blocked; it cascade-detaches instead.)
+into reclamation for its window (at least the chain floor), and a repeated close before the deadline fails. When the
+window ends, either the tenant's second close or the provider's close of the lease completes it, with the same end
+state; a tenant close after the provider's succeeds and changes nothing. `MsgCloseLease` on the volume lease is a move
+(`volume_migrate`): the group stays open and re-lists. `MsgCloseDeployment` and `MsgCloseGroup` end the volume
+(`volume_closed_retain`: the deployment, or only the group, closes as the tenant asked) and are rejected outright while
+a compute lease is attached -- a mounted database never loses its backing lease to a tenant fat-finger; tenants close
+compute first. Moving an attached volume is allowed: its compute is detached when the window ends. (The
+escrow-exhaustion cascade cannot be blocked; it cascade-detaches instead.) A volume group cannot be paused or
+restarted: a paused volume would hold its name while its data aged out, and a restarted one could be won by a provider
+that holds none of its data.
 
-**Provider reclaim.** A provider ends a volume lease by starting reclaim with `volume_evict`, which re-lists the group
-when the window ends, exactly as a tenant move does. Any other reclaim reason pauses the group without re-listing.
+**Provider reclaim.** A provider ends a volume lease by starting reclaim. Whatever reason it gives, the chain records
+`volume_evict` and re-lists the group when the window ends, exactly as a tenant move does, so the next provider has a
+source to copy from.
 
 New vocabulary is additive only: volume close reasons in the established reason ranges, typed attach/detach/adopted
 events, the bid's `volume_policy`, the lease's close time, volume error codes, and the parameters
@@ -432,9 +440,10 @@ The provider-side contract, at specification level (mechanics in
 - **A restart-survivable record.** The operator maintains a per-volume custom resource recording owner, `vid`,
   on-chain identity, class, size, retention, and phase; all state is re-derivable from cluster objects plus chain
   queries.
-- **One garbage-collection path.** Data is destroyed only after the retention deadline: the close the operator
-  observed plus the volume's retention (a `delete` volume is released at close). Never directly on a lease-closed
-  event.
+- **One garbage-collection path.** Data is destroyed only after its deadline: the lease's close time on chain plus
+  the volume's retention, with a short margin past it so an adoption in the deadline's last block never races the
+  collection (a `delete` volume is released at close). A volume that moved is held until the move's copy has landed
+  (see [Migration](./README.md#migration)). Never directly on a lease-closed event.
 - **Inventory honesty.** Volume bytes are durable allocations: bid-time gating reads live per-class capacity, durable
   reservations are never thin-provisioned or released on lease close, and parked, retained, and moving volumes count
   as used capacity until they are released.
@@ -447,15 +456,15 @@ The provider-side contract, at specification level (mechanics in
 ### Migration
 
 Migration reuses the lease reclamation primitive verbatim; no separate migration-window mechanism exists. The
-reclamation window is the notice period, and the copy runs after the source lease closes, inside the source's
-retention window:
+reclamation window is the notice period, and the copy runs after the source lease closes, while the source holds the
+volume for the move:
 
 1. The provider starts reclaim on the volume lease (`volume_evict`), or the tenant closes it (`MsgCloseLease`,
    `volume_migrate`). The lease enters reclamation for its window, at least the chain floor. The volume keeps serving
    its workload.
 2. When the window ends, the lease closes (the provider's `MsgCloseBid`, or the tenant's close after the deadline):
    cascade-detach force-closes any attached compute lease, and the market's automatic re-order loop re-lists the
-   still-open volume group. The source keeps the data until the close plus the volume's retention.
+   still-open volume group. The source holds the data for the move, whatever the volume's retention (below).
 3. The tenant accepts a bid from a new provider. The destination provisions the volume as importing and pulls the
    source's data once the source is final (its lease closed and nothing mounting the volume): a checksummed, resumable
    image or file stream for a disk, every object with its metadata for a bucket. The transfer runs over mutually
@@ -465,11 +474,14 @@ retention window:
    when a newer one's own copy never finished arriving. No self-asserted identity anywhere.
 4. Compute attach bids gate to the destination as soon as it holds the lease; the destination declines to attach the
    volume until the copy lands and the volume is parked. If the copy keeps failing, the destination starts its own
-   reclaim and the order re-lists again, while the source still holds the data until its retention ends.
+   reclaim and the order re-lists again, and the source keeps holding the data for the next destination.
 
-A move therefore needs a retention window long enough to cover the re-listing, the tenant accepting a bid, and the
-copy: with no retention, the source releases the data when its lease closes. The workload is down from the close
-until the copy lands and its compute is redeployed at the destination.
+**The move hold.** After a move closes the source lease, the source keeps the volume until a complete final copy has
+gone to the provider holding the new lease, plus a short margin for that provider to verify it, and never before the
+close plus the volume's retention. The hold is bounded: the source releases the volume no later than the close plus
+the longer of its retention and the move hold (7 days by default, the time a re-listed volume order stays open for
+bids). Every volume can therefore move, retention or not; retention only adds the adoption tail. The workload is down
+from the close until the copy lands and its compute is redeployed at the destination.
 
 The default transfer driver is stream export: a snapshot of the volume's image (a file tree for non-RBD classes)
 streamed by the provider itself. It works between mutually untrusted providers with no Ceph cluster peering, no
@@ -484,12 +496,15 @@ machinery: the replica's provider is paid by the replica lease, and the primary'
 `max_replicas` in its group spec, so it was priced into the primary's bid rather than being an unpaid convention
 between competitors.
 
-The replica's provider pulls periodic copies from the primary's provider over the same authenticated transfer service
-(snapshot diffs for RBD volumes), on an interval it sets. The primary's provider serves a replica only to the provider
-holding that replica's lease, and reports the replica's lag in its transfer status. **The chain attests nothing about
+The replica's provider pulls from whichever provider holds the primary's active lease (re-read from chain every round,
+so a replica follows its primary through moves) over the same authenticated transfer service: a whole copy first, then
+periodic copies on an interval it sets (snapshot diffs for RBD volumes). The replica cannot be attached until its first
+whole copy has landed, and a round never writes while compute holds the volume. The primary's provider serves a replica
+only to the provider holding that replica's lease, and never pulls from its own replica; a provider declines to hold a
+replica of a primary it holds itself. Lag is reported on the replica's lease status. **The chain attests nothing about
 replica consistency in this AEP** -- promotion is tenant-driven: redeploy compute pointing at the replica's reference.
-Buckets have no replicas. Application-level replication remains fully supported and needs no provider machinery at
-all.
+Once compute attaches to a replica, it stops syncing for good, so a promoted replica is never overwritten. Buckets have
+no replicas. Application-level replication remains fully supported and needs no provider machinery at all.
 
 ### Economics
 
@@ -513,8 +528,10 @@ all.
   bankruptcy; market identity (dseq) does not, and the owner finds the data again by its `vid`, which is recorded on
   the volume's group.
 - **The trust framing, stated plainly.** The *reclamation window* is the guarantee: chain-enforced notice, bonded by a
-  still-open, still-paying lease, through which the volume keeps serving. The *retention window* after close is a
-  bounded, known, priced best-effort tail that covers adoption and the copy of a move -- never open-ended courtesy.
+  still-open, still-paying lease, through which the volume keeps serving. After the close, the provider owes two
+  bounded, unpaid tails: the *move hold*, until a moving volume's copy has landed (at most 7 days by default), and the
+  *retention window*, the known, priced tail that covers adoption. Neither is open-ended courtesy, and both are
+  best-effort promises rather than bonded ones.
 
 Escrow grace ("top up to save your database" on-chain) is deliberately deferred: it modifies the most
 consensus-sensitive code in the stack. Its required shape is pre-specified in the design of record so a follow-up AEP
@@ -559,8 +576,9 @@ chosen here let a future facade alias them without breaking anything.
 ## Security Considerations
 
 - **Data destruction.** Only the storage operator's garbage collection destroys a volume's data (a disk's persistent
-  volume and image; a bucket, its objects, and its backend user), and only after the retention deadline it set when it
-  observed the close. Retain-at-provision and out-of-lease-namespace data make destruction via namespace teardown,
+  volume and image; a bucket, its objects, and its backend user), and only after its deadline: the lease's close time
+  on chain plus retention and a short margin, or, for a volume that moved, once its copy has landed (bounded by the
+  move hold). Retain-at-provision and out-of-lease-namespace data make destruction via namespace teardown,
   lease-closed reflexes, or daemon downgrades structurally impossible, and a provider binary without volume support
   never holds a volume, because it cannot win one. An import replaces only the destination's own older copy of the
   same volume.
@@ -583,13 +601,13 @@ chosen here let a future facade alias them without breaking anything.
 - **Data-plane authentication and authorization.** Mutual TLS rooted in on-chain provider certificate identities,
   with the requester bound to its client certificate; authorization derived from chain state on both ends; a move
   copies a final source only; transfers resume and carry per-chunk and whole-image checksums (per-chunk and
-  per-object for buckets). No
-  storage-cluster daemons or pool-scoped credentials are exposed between untrusted providers. A compromised exporter
+  per-object for buckets). No storage-cluster daemons or pool-scoped credentials are exposed between untrusted
+  providers, and nothing a peer sends reaches a shell on the exporter's storage tools. A compromised exporter
   can serve corrupt data -- importers verify checksums, and application-level replication plus tenant-side encryption
   remain the paranoid options (encryption-at-rest guarantees are out of scope and documented as such).
 - **Provider trust model, stated.** A provider can always destroy data it hosts; retention honesty is economic and
   reputational -- bounded, priced, and bonded through reclamation -- softened by replication (`max-replicas >= 1` is
-  recommended and the CLI warns at zero). A move's copy relies on the source honoring its retention after the lease
+  recommended and the CLI warns at zero). A move's copy relies on the source honoring the move hold after the lease
   closes. What this design removes is *protocol-caused* destruction. There are no cryptographic proofs of storage in
   v1.
 - **Economic griefing and denial of service.** Volumes are deposit-backed deployments (existing spam economics); the
@@ -608,9 +626,8 @@ chosen here let a future facade alias them without breaking anything.
 ## Limitations
 
 - **Resize is specified separately.** Growing a volume or bucket in place is part of the In-Place Lease Resize AEP.
-- **Moves depend on retention and copy the whole volume.** The copy runs after the source lease closes, inside its
-  retention window; a volume with no retention cannot move, and the workload is down from the close until the copy
-  lands.
+- **Moves copy the whole volume, after the close.** The copy runs once the source lease has closed, so the workload is
+  down from the close until the copy lands, and the source holds the data unpaid for at most the move hold.
 - **Overdraw is terminal on-chain.** A missed top-up closes the volume lease. The runway event, the retention window,
   and adoption compensate -- but market identity (dseq) does not survive bankruptcy, and attach references to the dead
   dseq must be re-resolved by `vid`.
