@@ -152,7 +152,8 @@ the lease closes. Storage is bounded at one record per deployment.
    (`ErrLeaseResizeChanged`).
 2. It has not expired (`ErrLeaseResizeExpired`), and the lease is still active.
 3. `price` uses the lease's denom, and `0 < price <= max_price` (`ErrLeaseResizePriceTooHigh`).
-4. The merged spec is re-derived against the group as stored now.
+4. The merged spec is re-derived against the group as stored now; for a volume group the size cap and the
+   live-replication rule are checked again, so a replica created after the request blocks the accept.
 5. **Escrow switches rate** ([Escrow](#escrow)): the lease's payment is settled at the old rate through this block,
    the accept fails if the account is overdrawn, and the payment's rate becomes `price`.
 6. Both copies of the spec are rewritten: the group's spec (`x/deployment`) and the active order's spec
@@ -216,12 +217,15 @@ A bucket grows the same way; its provider raises the bucket's quota.
 ### Provider Responsibilities
 
 **Admission.** A provider learns of a request from `EventLeaseResizeRequested` for one of its leases, and lists its
-pending requests when it starts. It re-reads the request and stops without answering if the request is gone, its
+pending requests when it starts and every minute after, so a request whose event it missed is still answered. It
+re-reads the request and stops without answering if the request is gone, its
 digest has changed, or it has expired. Otherwise it judges the merged spec the way it judges a bid:
 
 1. the merged spec must apply cleanly, or it rejects `reject_unsupported`;
 2. the same gates as a bid (attributes, capabilities including GPU, auditors); for a volume or bucket, its volume
-   terms, plus a class the provider can expand in place;
+   terms, plus, for a disk, a class the provider can expand in place (a bucket grows by a quota raise, which needs no
+   expansion); at startup the provider drops any configured class whose Retain StorageClass does not allow volume
+   expansion, so it never accepts a growth it cannot apply;
 3. capacity for the full new spec, alongside the lease's current pods (the old pods are not credited back, so this
    never over-commits against the provider's view, at the cost of declining a resize that would only fit by reusing
    the old pods' room); a volume checks only its growth; failing either rejects `reject_capacity`;
@@ -235,6 +239,13 @@ recomputes its scheduling parameters, and holds the reservation as pending until
 then sends the manifest for the new size; the provider checks it against the deployment's new hash and the resized
 group and redeploys in place, in the same namespace: each service's pods roll one at a time with no surge, with
 requests and limits from the new resources and the new replica count. Services that mount a volume keep it.
+
+- A resize that changes no resources (the price alone) leaves the reservation as it is.
+- If no manifest for the new size arrives within `--lease-resize-manifest-timeout` (10 minutes by default, the
+  chain's default request lifetime), the reservation follows the deployment that is running again: the provider stops
+  holding the difference, so a later roll may not fit.
+- At startup and every five minutes, the provider compares each active lease's group on chain with its reservation
+  and applies any resize whose event it missed (a restart between the accept and the event included).
 
 **Applying a volume or bucket resize.** The provider raises its volume record to the new size (it never lowers it),
 and the storage operator grows the claim that holds the volume, parked or attached; the storage driver expands the
@@ -328,12 +339,18 @@ moves:
 | AnswerNamesItsRequest              | cancel and re-request in one block; the old digest is refused           |
 | AcceptAfterSameBlockWithdraw       | an accept in the block of a withdrawal settles correctly                |
 | AdoptGrownVolume                   | adopting a grown volume requires its new size                           |
-| ReplicatingVolumeKeepsItsSize      | a volume in a live replication cannot be resized                        |
+| ReplicatingVolumeKeepsItsSize      | a volume in a live replication cannot be resized, at request and again at accept |
+| compute resize downward            | a shrink, with exact escrow and withdrawal amounts                      |
+| bucket grow                        | a bucket grows through a lease resize                                   |
+| reclaim mid-resize                 | `MsgLeaseStartReclaim` clears a pending resize                          |
 
 Unit tests cover the change rules (21 cases, plus the frozen count of volume-mounting units), message validation,
-expiry at its boundary, the digest, the query by deployment, the CLI's choice of target lease, and on the provider:
-the resize evaluator (accept with the digest; each reject reason; volume headroom on the growth; expired, answered,
-and replaced requests; catch-up at start), the reservation swap, the manifest refetch after a resize, and the storage
+expiry at its boundary, the digest, the query by deployment, the CLI's choice of target lease, `PaymentUpdateRate`
+(old rate through the current block, then the new one; overdrawn, closed, wrong-denom, and zero-rate refusals; the
+same-block fallback; exact runway values), and on the provider: the resize evaluator (accept with the digest; each
+reject reason; volume headroom on the growth; bucket growth without an expandable class; expired, answered, and
+replaced requests; catch-up at start and the periodic re-list), the reservation swap (price-only, already-deployed,
+and manifest-timeout cases), the resync of missed resizes, the manifest refetch after a resize, and the storage
 operator growing parked and attached claims and bucket quotas without ever shrinking them.
 
 Live, on a local chain with three providers on one kind cluster:
@@ -344,11 +361,14 @@ Live, on a local chain with three providers on one kind cluster:
 | -> 0.25 CPU, 256 MiB, 256 MiB, 1 replica                                  | accepted in 2 s; -> 13.83 uact per block; the pod running at the new size 4 s after the request |
 | -> 2 CPU, 2 GiB with a ceiling of 1 uact                                  | rejected `reject_price` (quote 100); lease, price, and pod unchanged |
 | CPU 2 -> 2.5 -> 1 -> 1.5 from Console                                    | accepted; the pod rolled each time; cancel, decline, and re-apply work |
-| a managed Postgres database: memory 1 -> 2 GiB and its volume 2 -> 3 GiB  | both leases resized; the database back in about 20 s with its data |
-| two managed Postgres volumes 2 -> 3 GiB on Ceph RBD                       | grown in place; replication intact           |
-| a volume grow on a class that cannot expand (local-path)                  | declined `reject_unsupported`                |
+| 0.5 -> 1 CPU accepted by hand while the provider was stopped              | on restart the provider resynced the reservation with the missed resize; the new manifest rolled the pod to 1 CPU |
+| a managed Postgres database: memory 1 -> 2 GiB and its volume 2 -> 3 GiB  | both leases resized on chain; the database back in about 20 s with its data |
+| a provider configured to grow a class whose Retain twin cannot expand (local-path) | the class is dropped at startup with an error, and its growth is declined `reject_unsupported` |
 
-GPU resizes are covered only by unit tests (no GPUs in the test cluster).
+The test cluster's storage classes are all local-path, which cannot expand a claim, so the volume rows above prove
+the chain and provider flow, not a disk actually growing: growing a claim on an expandable class (Ceph RBD, for one)
+is covered by the storage operator's unit tests only. GPU resizes are covered only by unit tests (no GPUs in the test
+cluster).
 
 ## Reference Implementation
 
@@ -374,8 +394,11 @@ storage market.
 | Manifest refetch          | `provider/manifest/{manager.go,service.go}`                                            |
 | Volume and bucket growth  | `provider/operator/storage/{operator.go,reconciler.go,bucket.go}`, `provider/cluster/kube/client_volume.go` |
 
-Provider flag: `--volume-growable-classes` names the volume classes the provider can expand in place (empty by
-default, which declines every volume and bucket growth). Price and capacity use the provider's existing bid settings.
+Provider flags: `--volume-growable-classes` names the disk classes the provider can expand in place (empty by
+default, which declines every disk growth; buckets need none; a class whose Retain StorageClass does not allow
+expansion is dropped at startup), and `--lease-resize-manifest-timeout` (10 minutes)
+bounds how long an accepted resize holds capacity for the tenant's new manifest. Price and capacity use the
+provider's existing bid settings.
 
 ## Security Considerations
 
@@ -405,13 +428,9 @@ default, which declines every volume and bucket growth). Price and capacity use 
 - **Brief restart.** Pods roll with no surge. Zero-downtime rollouts, and crediting the old pods back per node in the
   capacity check, are future work.
 - **No provider-initiated resize** (for example, downsizing an over-provisioned lease).
-- **Reference implementation gaps:** a provider catches up on pending requests only when it starts, so a request
-  whose event it misses while running goes unanswered until it expires; a provider restart between the accept and the
-  resized event loses the reservation swap until the next restart; a tenant who never sends the new manifest, or a
-  resize that rolls no pods (price only), leaves the new size pending in the provider's inventory with no timeout;
-  the accept does not re-check the replication rule, so a replica created between a volume's request and its accept
-  is not blocked; and bucket growth requires the class in `--volume-growable-classes` although a quota needs no
-  expansion. There is no provider kind e2e for resize yet.
+- **Reference implementation gaps:** if a provider misses `EventLeaseResized` and the tenant's new manifest arrives
+  before the provider's next five-minute resync, that deploy uses the old scheduling parameters, which matters only
+  for a change in GPU count (interconnect). There is no provider kind e2e for resize yet.
 
 ## Copyright
 
