@@ -6,175 +6,204 @@
 > provider code changes, the upgrade handler, and the test plan. It does not repeat specification-level content.
 > For the design, behavior, rules, and rationale, see [README.md](./README.md).
 
-Target repos: `chain-sdk`, `node`, `provider` (go.work monorepo layout).
+Target repos: `chain-sdk`, `node`, `provider` (go.work monorepo layout), and `helm-charts` (the storage operator
+chart).
+
+Reference implementation: branch `storage-market/active-versions` of
+[chalabi2/chain-sdk](https://github.com/chalabi2/chain-sdk/tree/storage-market/active-versions),
+[chalabi2/node](https://github.com/chalabi2/node/tree/storage-market/active-versions), and
+[chalabi2/provider](https://github.com/chalabi2/provider/tree/storage-market/active-versions), and branch
+`storage-market/core` of [chalabi2/helm-charts](https://github.com/chalabi2/helm-charts/tree/storage-market/core).
+These branches also carry lease resizing, which a separate AEP specifies and this document leaves out.
 
 ---
 
 ## 1. Codebase-Specific Implementation Notes
 
-### 1.1 Proto Placement: Staged Version Directories, Decided Once
+### 1.1 Proto Placement: The Active Versions
 
-All consensus-shape changes land in the staged `deployment/v1beta5` and `market/v2beta1` proto directories, activated
-by removing them from `chain-sdk/buf.yaml` `excludes`. Active wire types are never touched -- above all
-`base.resources.v1beta4.Storage`, which is shared with deployed inventory, manifest, and operator surfaces. The attach
-reference (`VolumeRef`) therefore lives on `deployment/v1beta5.ResourceUnit`, not on base resources; `base/resources`
-stays at v1beta4.
+Every consensus-shape change is an additive field on the API versions the network already runs, plus one new stable
+package for the provider data plane:
 
-This makes old-binary safety structural: volume orders and volume-bearing compute orders are `market/v2beta1` types
-that deployed bid engines **cannot decode** -- not "can decode but should filter". The rollout does not depend on
-unverified `shouldBid` code-path ordering in shipped binaries.
+| Package                           | Additions                                                                    |
+| --------------------------------- | ---------------------------------------------------------------------------- |
+| `akash.deployment.v1` (stable)    | `volume.proto` (`VolumeRef`, `VolumePolicy`), `EventVolumeAdopted`, errors 27-32 |
+| `akash.deployment.v1beta4`        | `GroupSpec.volume = 4`, `ResourceUnit.volumes = 4`, `Params` fields 2-4       |
+| `akash.market.v1` (stable)        | volume close reasons, `EventVolumeAttached`/`Detached`, `Lease.closed_at = 8` |
+| `akash.market.v1beta5`            | `Params` fields 6-7, `MsgCreateBid.volume_policy = 6`                         |
+| `akash.escrow.v1` (stable)        | `EventAccountRunway`                                                          |
+| `akash.manifest.v2beta3`          | `StorageParams.volume = 4`                                                    |
+| `akash.volume.v1` (new)           | the `VolumeTransfer` gRPC service                                             |
 
-**Phase 0 prerequisite commit (blocking).** The staged dirs diverge from `main`: they lack the reclamation fields the
-fork already ships (`Reclamation` on deployment msgs, `Order.Reclamation`, `Bid.ReclamationWindow`) and carry an
-unfinished repeated-prices/deposits redesign. Before anything else:
+`base.resources.v1beta4` is untouched, so deployed inventory, manifest, and operator surfaces see no new resource
+shape. The staged `deployment/v1beta5` and `market/v2beta1` directories are untouched and stay excluded in
+`buf.yaml`.
 
-1. Port the reclamation fields into `deployment/v1beta5/deploymentmsg.proto` and
-   `market/v2beta1/order.proto`/`bid.proto`.
-2. Revert the repeated-prices redesign back to `main`'s active shapes, so activation is a pure superset of
-   v1beta4/v2beta5 and the store migrations are re-serialization only.
+**Old-binary safety is a bid-time gate, not a decode failure.** Volume orders are ordinary `market.v1beta5.Order`s
+that every provider decodes; an old binary drops `GroupSpec.volume` as an unknown field. Three gates keep old binaries
+from holding a volume:
 
-The staged dirs become "active shapes + storage market additions", nothing more.
+1. the SDL puts `capabilities/storage/volumes: "true"` (or `capabilities/storage/buckets: "true"`) into the placement
+   requirements, which providers without volume support do not advertise;
+2. `CreateBid` on a volume order requires `MsgCreateBid.volume_policy` equal to the order's policy (market error 107),
+   and an old binary never sets it;
+3. an attach order is biddable only by the provider holding the volume's active lease.
 
-**Registration checklist per touched version** (the standard chain-sdk drill): hand-written `codec.go`
-(`RegisterInterfaces`; **zero new Msg types**, so no new `RegisterCustomSignerField` entries), `key.go`, `msgs.go`,
-`errors.go`, `params.go`; new Query surfaces added to `docs/config.yaml`; `make lint-proto`, `proto-check-breaking`,
-`mocks`.
+**Registration.** The storage market adds no Msg types and no Query RPCs, so there are no new `RegisterInterfaces` or
+`RegisterCustomSignerField` entries. (The `codec.go` additions on the reference branches belong to lease resizing.)
 
 ### 1.2 Zero New Msg Types; AuthorizeDeposits Untouched
 
-The complete flow rides existing messages (see the message table in the README). Consequences:
+The complete flow rides existing messages (see the message table in the README); `MsgCreateBid` gains a field, not a
+type.
 
-- No `AuthorizeDeposits` switch entries (`MsgCreateDeployment`/`MsgDepositDeployment` are already in it,
-  `node/x/escrow/keeper/keeper.go:252-282`).
-- **Test obligation (U1):** explicit tests that grant-funded volume deployments work (the `AuthorizeDeposits` switch
-  behaves for volume groups).
+- The grant switch (`node/x/escrow/keeper/keeper.go:253-283`) already covers `escrow.v1.MsgAccountDeposit`,
+  `deployment.v1beta4.MsgCreateDeployment`, and `market.v1beta5.MsgCreateBid`, and is untouched.
+- **Test obligation:** grant-funded volume deployments (`node/tests/e2e/storagemarket_test.go`).
 
 ### 1.3 Escrow Hooks Hardening (prerequisite-grade, ships in U1)
 
-Fix `node/x/market/hooks/hooks.go:31-34`: `OnEscrowAccountClosed` must `return nil` for any XID that fails
-`DeploymentIDFromEscrowID`, mirroring the payment hook -- hook errors abort `saveAccount` **mid-write** (refunds and
-`store.Set` already applied). This AEP adds no new scope and never triggers the bug, but it corrupts state for any future
-scope.
+`OnEscrowAccountClosed` returns `nil` for any XID that fails `DeploymentIDFromEscrowID`, mirroring the payment hook
+(`node/x/market/hooks/hooks.go:34-37`): hook errors used to abort `saveAccount` **mid-write** (refunds and `store.Set`
+already applied). This AEP adds no new scope and never triggers the bug, but it corrupts state for any future scope.
 
-**Test obligation:** the foreign-scope hook error is currently masked by `_ = k.ekeeper.AccountClose(...)` at
-`node/x/market/keeper/keeper.go:310` swallowing it for `ScopeBid`. Tests must cover the current masking and prove
-bid-escrow account-close behavior is byte-identical after the fix -- proven, not assumed.
+**Test obligation:** the foreign-scope hook error is masked by `_ = k.ekeeper.AccountClose(...)` at
+`node/x/market/keeper/keeper.go:347`, which swallows it for `ScopeBid`. `keeper_escrow_masking_test.go` and
+`hooks_test.go` cover the masking and prove bid-escrow account-close behavior is byte-identical after the fix.
 
 ### 1.4 Canonical Empty Manifest
 
-A storage-only deployment has no services. The canonical volume manifest is a single group with the on-chain group
-name and an empty service list; its `Manifest.Version()` (sha256 over SortJSON) is deterministic and version-pinned;
-the CLI computes it for `MsgCreateDeployment.Hash`. Manifest v2beta4 `Manifest.Validate()` accepts zero services iff
-every paired on-chain group is a volume group. **Golden-file tests across client versions** -- this hash is
-consensus-adjacent and gets manifest-hash rigor.
+A storage-only deployment has no services. The canonical volume manifest is
+`[{"name":"<placement name>","services":null}]`; the CLI hashes it for `MsgCreateDeployment.Hash`. Manifest `v2beta3`
+validation accepts zero-service groups, and `CheckAgainstGSpecs` pairs them with the chain: zero services on a
+non-volume group is `ErrInvalidManifest`, and services on a volume group is `ErrManifestCrossValidation`. The hash for
+placement `us-west`, `74066c155b207484e1e3671548c44e5c9dff4d2fbd1293f61fd4f7f466a24e0e`, is pinned in Go tests
+(`go/sdl/v2_2_test.go`, `go/cli/volume_tx_test.go`) -- this hash is consensus-adjacent and gets manifest-hash rigor.
+
+The provider never receives a manifest for a volume lease: its manifest manager rejects an upload for a deployment
+whose leases on that provider are all volume leases.
 
 ### 1.5 Feature Flag
 
-`market/v2beta1.Params.volume_orders_enabled` (default `false`, governance-flipped) gates volume-group
-`CreateDeployment` (checked in `x/deployment` via the existing `dimports.MarketKeeper` interface,
-`node/x/deployment/imports/keepers.go:21`) and, defense-in-depth, `CreateBid` on volume orders. Phase 1 ships every
-new path unreachable behind it.
+`market.v1beta5.Params.volume_orders_enabled` (field 6, default `false`, governance-flipped) gates:
+
+- volume-group `CreateDeployment`, checked in `x/deployment` through the `MarketKeeper.VolumeOrdersEnabled` method on
+  `dimports.MarketKeeper` (`node/x/deployment/imports/keepers.go`), failing with `ErrVolumeOrdersDisabled`
+  (deployment 27);
+- defense-in-depth, `CreateBid` on volume orders (market 100).
+
+Compute deployments, bids, and leases that reference volumes, `MsgStartGroup`, and the re-order of a moved volume are
+not flag-checked: they need a volume lease, which cannot exist while the flag has always been off. A flag turned off
+after launch stops new volumes and volume bids and leaves existing volumes working.
 
 ### 1.6 SDL Version Gate
 
-`sdl.UnmarshalYAML` (`chain-sdk/go/sdl/sdl.go`) routes `>= 2.1.0` open-endedly to v2.1 today. Change to:
-`== 2.0.0 -> v2`, `>= 2.1.0 && < 2.2.0 -> v2_1`, `>= 2.2.0 && < 3.0.0 -> v2_2`; update `sdl-input.schema.yaml` in
-lockstep. Add `Volumes()` to `interface SDL`.
+`sdl.UnmarshalYAML` (`chain-sdk/go/sdl/sdl.go`) routes `== 2.0.0 -> v2`, `>= 2.1.0 && < 2.2.0 -> v2_1`,
+`>= 2.2.0 && < 3.0.0 -> v2_2`, and `sdl-input.schema.yaml` moves in lockstep: the version enum is `2.0 | 2.1 | 2.2`,
+`volumes` is allowed only in 2.2, and a 2.2 file needs services or volumes. v2 and v2.1 reject
+`params.storage.*.volume`. `interface SDL` gains `Volumes()`. `Read` and `ReadFile` take `ReadOption`s;
+`WithOwner(owner)` supplies the signer for references that omit `external.owner`.
 
 ---
 
 ## 2. Protobuf Definitions
 
-### 2.1 `akash/deployment/v1/volume.proto` (new file, stable package)
+gogoproto options (equality, custom names, nullability, durations) are omitted below.
 
-New *file* in a stable package is additive-safe; no existing message is reshaped. `VolumePolicy` lives in
-`deployment/v1` because it is identity/state vocabulary imported by v1beta5.
+### 2.1 `akash/deployment/v1/volume.proto` (stable package)
 
 ```proto
 // VolumeRef addresses one Storage entry of a storage-only ("volume") group.
+// String form: owner/dseq/gseq/name (ParseVolumeRef).
 message VolumeRef {
-  option (gogoproto.equal) = true;
-  string owner = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
-  uint64 dseq  = 2 [(gogoproto.customname) = "DSeq"];
-  uint32 gseq  = 3 [(gogoproto.customname) = "GSeq"];   // always 1 in v1
-  string name  = 4;                                      // Storage.Name in the volume group
+  string owner = 1;   // cosmos.AddressString
+  uint64 dseq  = 2;
+  uint32 gseq  = 3;   // always 1
+  string name  = 4;   // Storage.Name in the volume group
 }
 
 // VolumePolicy marks a group as a storage-only volume group and carries its
 // lifecycle contract. Presence of this message IS the volume discriminator.
 message VolumePolicy {
-  option (gogoproto.equal) = true;
-
   enum ReclaimPolicy {
-    option (gogoproto.goproto_enum_prefix) = false;
-    invalid = 0 [(gogoproto.enumvalue_customname) = "VolumeReclaimInvalid"];
-    retain  = 1 [(gogoproto.enumvalue_customname) = "VolumeReclaimRetain"];
-    delete  = 2 [(gogoproto.enumvalue_customname) = "VolumeReclaimDelete"];
+    invalid = 0;   // VolumeReclaimInvalid
+    retain  = 1;   // VolumeReclaimRetain
+    delete  = 2;   // VolumeReclaimDelete
   }
 
-  // vid: tenant-chosen data-continuity label (DNS-label grammar,
-  // [a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?). Typed field -- NEVER a storage
-  // attribute (attributes flow into AttributesSubsetOf provider matching at
-  // x/market/handler/server.go:95 and would make the order unbiddable).
+  // Access declares how deployments reach a volume's data.
+  enum Access {
+    mount  = 0;    // VolumeAccessMount: a disk compute leases on its provider attach
+    bucket = 1;    // VolumeAccessBucket: an S3 bucket served over the network; never attached
+  }
+
+  // vid: tenant-chosen data-continuity label, ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$.
+  // Typed field -- NEVER a storage attribute (attributes flow into provider
+  // attribute matching and would make the order unbiddable).
   string vid = 1;
 
   ReclaimPolicy reclaim = 2;
 
-  // retention: post-close window the provider must keep the data adoptable.
-  // Bounded by deployment Params.MaxVolumeRetention; priced into the bid.
-  // GC deadline is chain-computable: closedLease.ClosedAt + retention.
-  google.protobuf.Duration retention = 3
-      [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
+  // retention: post-close window the provider keeps the data.
+  // Bounded by deployment Params.max_volume_retention; priced into the bid.
+  google.protobuf.Duration retention = 3;
 
-  uint32 max_attachments = 4;   // validation forces 1 in v1 (RWO); RWX is additive
-  uint32 max_replicas = 5;      // export duty declared -> priced into the bid
+  uint32 max_attachments = 4;   // 1 for mount, 0 for bucket
+  uint32 max_replicas = 5;      // export duty declared -> priced into the bid; 0 for bucket
 
-  VolumeRef adopt = 6 [(gogoproto.nullable) = true];       // adoption of a dead retained volume
-  VolumeRef replica_of = 7 [(gogoproto.nullable) = true];  // this volume is a replica
+  VolumeRef adopt = 6;          // adoption of a dead retained volume
+  VolumeRef replica_of = 7;     // this volume is a replica
+
+  Access access = 8;            // json "access,omitempty"
 }
 ```
 
-### 2.2 `deployment/v1beta5` (staged dir, activated)
+`VolumePolicy` lives in `deployment/v1` because it is identity and state vocabulary imported by
+`deployment.v1beta4` (group spec, resource unit), `market.v1beta5` (the bid), and the `market.v1` and
+`deployment.v1` events. `mount` is `0` and the field is `omitempty`, so the JSON, amino sign bytes, and golden
+fixtures of disk volume policies carry no `access` at all.
 
-After Phase 0 reconciliation, v1beta5 shapes equal main's v1beta4 plus:
+### 2.2 `akash.deployment.v1beta4`
 
 ```proto
 message GroupSpec {
-  // name = 1, requirements = 2, resources = 3 unchanged from v1beta4
-  akash.deployment.v1.VolumePolicy volume = 4 [(gogoproto.nullable) = true];
-  // nil for every pre-storage-market group => migration is re-serialization only
+  // name = 1, requirements = 2, resources = 3 unchanged
+  akash.deployment.v1.VolumePolicy volume = 4;   // nil for every compute group
 }
 
 message ResourceUnit {
   // resource = 1 (base.resources.v1beta4.Resources -- UNCHANGED base type),
   // count = 2, price = 3 unchanged
-  repeated akash.deployment.v1.VolumeRef volumes = 4 [(gogoproto.nullable) = false];
-  // externally-leased volumes this unit's services mount; empty pre-storage-market
+  repeated akash.deployment.v1.VolumeRef volumes = 4;
+  // externally leased volumes this unit's services mount; empty for every other unit
 }
 
 message Params {
-  // existing fields unchanged
-  uint64 max_volume_size = N;                       // bytes; volume groups ONLY
-  google.protobuf.Duration max_volume_retention = N+1
-      [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
-  uint32 max_volume_replicas = N+2;
+  // field 1 unchanged
+  uint64 max_volume_size = 2;                          // bytes; default 32Ti; must be > 0
+  google.protobuf.Duration max_volume_retention = 3;   // default 720h
+  uint32 max_volume_replicas = 4;                      // default 4
 }
 ```
 
-Because `market.v2beta1.Order` embeds this GroupSpec, volume policy and attach refs flow into orders -- and therefore
-into bidengine `Request`s -- with zero additional market proto surface for the order path.
+`market.v1beta5.Order.spec` (field 3) embeds this `GroupSpec`, so the volume policy and attach references flow into
+orders -- and therefore into bid engine requests -- with no other order-path proto change.
 
-### 2.3 `market/v1` (stable) -- additive vocabulary only
+### 2.3 `akash.market.v1` (stable) -- additive vocabulary only
 
-Identity types (`OrderID/BidID/LeaseID`, `Lease`, `Reclamation`) untouched -- the `mv1.LeaseID(bid.ID)` raw struct
-cast and the exactly-5-part payment-XID parse stay safe.
+Identity types (`OrderID`/`BidID`/`LeaseID`, `Reclamation`) are untouched -- the `mv1.LeaseID(bid.ID)` raw struct
+cast and the exactly-5-part payment-XID parse stay safe. `Lease` gains one field:
+
+```proto
+int64 closed_at = 8;   // block time (unix seconds) of the close; 0 while open or for leases closed before the upgrade
+```
 
 Close reasons (`market/v1/types.proto`, established ranges: 1-9999 owner, 10000+ provider, 20000+ network):
 
 ```proto
-reason_volume_migrate       = 101;     // owner closes volume lease to migrate
-reason_volume_evict         = 10101;   // provider decommissions (via reclaim)
-reason_volume_closed_retain = 20101;   // tenant closed volume; retain window runs
+reason_volume_migrate       = 101;     // tenant MsgCloseLease on a volume lease: a move
+reason_volume_evict         = 10101;   // provider reclaim that re-lists the volume
+reason_volume_closed_retain = 20101;   // tenant closed the volume; retention runs
 reason_volume_unfunded      = 20102;   // escrow exhaustion cascade
 reason_volume_detach        = 20103;   // compute lease force-closed by cascade-detach
 ```
@@ -183,12 +212,12 @@ Typed events (`market/v1/event.proto`, emitted via `EmitTypedEvent`):
 
 ```proto
 message EventVolumeAttached {
-  akash.market.v1.LeaseID lease_id = 1 [(gogoproto.nullable) = false]; // compute lease
-  akash.deployment.v1.VolumeRef volume = 2 [(gogoproto.nullable) = false];
+  akash.market.v1.LeaseID lease_id = 1;          // compute lease
+  akash.deployment.v1.VolumeRef volume = 2;
 }
 message EventVolumeDetached {
-  akash.market.v1.LeaseID lease_id = 1 [(gogoproto.nullable) = false];
-  akash.deployment.v1.VolumeRef volume = 2 [(gogoproto.nullable) = false];
+  akash.market.v1.LeaseID lease_id = 1;
+  akash.deployment.v1.VolumeRef volume = 2;
   akash.market.v1.LeaseClosedReason reason = 3;
 }
 ```
@@ -197,36 +226,41 @@ Deployment event (`deployment/v1/event.proto`):
 
 ```proto
 message EventVolumeAdopted {
-  akash.deployment.v1.GroupID id = 1 [(gogoproto.nullable) = false];        // new volume
-  akash.deployment.v1.VolumeRef adopted = 2 [(gogoproto.nullable) = false]; // dead volume
+  akash.deployment.v1.GroupID id = 1;          // new volume
+  akash.deployment.v1.VolumeRef adopted = 2;   // dead volume
   string vid = 3;
 }
 ```
 
-### 2.4 `market/v2beta1/params.proto` (staged dir, activated)
+### 2.4 `akash.market.v1beta5`
 
 ```proto
 message Params {
-  // existing (incl. Min/MaxReclamationWindow) unchanged
-  bool volume_orders_enabled = N;      // THE feature flag; default false, gov-flipped
-  google.protobuf.Duration min_volume_reclamation_window = N+1
-      [(gogoproto.nullable) = false, (gogoproto.stdduration) = true];
+  // existing fields (incl. Min/MaxReclamationWindow) unchanged
+  bool volume_orders_enabled = 6;                              // THE feature flag; default false, gov-flipped
+  google.protobuf.Duration min_volume_reclamation_window = 7;  // default 24h
+}
+
+message MsgCreateBid {
+  // existing fields unchanged
+  akash.deployment.v1.VolumePolicy volume_policy = 6;  // must equal the order's on a volume order; unset otherwise
 }
 ```
 
-### 2.5 `escrow/v1/event.proto` (the only escrow-package touch; no state change)
+`Params` fields 8-9 on the reference branches belong to lease resizing.
+
+### 2.5 `akash.escrow.v1` (`event.proto`; the only escrow-package touch; no state change)
 
 ```proto
-// Emitted at every settle of an account with open payments: the deterministic,
-// tenant-computable exhaustion deadline.
+// Emitted when a settle of an account with open payments advances at least one
+// block and leaves the account funded: the tenant-computable exhaustion deadline.
 message EventAccountRunway {
-  akash.escrow.id.v1.Account id = 1
-      [(gogoproto.nullable) = false, (gogoproto.customname) = "ID"];
+  akash.escrow.id.v1.Account id = 1;
   int64 projected_depletion_height = 2;   // 0 = funds cover no full block
 }
 ```
 
-### 2.6 Manifest `v2beta4` (new version dir under `proto/provider/.../manifest`)
+### 2.6 Manifest `akash.manifest.v2beta3`
 
 ```proto
 message StorageParams {
@@ -234,38 +268,109 @@ message StorageParams {
   string mount = 2;          // mount topology stays off-chain, as today
   bool read_only = 3;
   // volume mirrors the on-chain VolumeRef as "owner/dseq/gseq/name";
-  // empty for locally-provisioned (AEP-15) storage.
+  // empty, and omitted from JSON, for locally provisioned (AEP-15) storage.
   string volume = 4;
 }
 ```
 
-`Service.checkAgainstGSpec` in the v2beta4 path requires the set of manifest `StorageParams.volume` refs to equal the
-on-chain `ResourceUnit.Volumes` exactly (index-wise, after canonical sort by name). Manifest v2beta3 behavior is
-byte-identical -- every new field exists only under new version numbers, preserving determinism at both load-bearing
-points (manifest sha256/SortJSON hash; GroupSpec construction order).
+`Service.checkVolumesAgainstResources` requires a service's manifest volume references to equal its unit's
+`ResourceUnit.volumes` exactly, compared after sorting by the full `owner/dseq/gseq/name` string. Because the field is
+omitted when empty, every existing manifest hashes exactly as before; the TS manifest hasher mirrors the omission
+(`generateManifestVersion.ts`).
 
-### 2.7 `VolumeTransfer` gRPC (`proto/provider/akash/volume/v1`; data plane, off-chain)
+### 2.7 `akash.volume.v1.VolumeTransfer` (data plane, off-chain)
 
-grpc-gateway pattern per `inventory/v1`; served by the storage operator on the provider gateway:
+Served by the provider daemon on its gateway gRPC port. `Export` and `ExportObjects` are server streams (gRPC only);
+`Status` also declares an HTTP mapping (`GET /v1/volume/status`) that the provider does not serve.
 
 ```proto
 service VolumeTransfer {
-  rpc Export(ExportRequest) returns (stream ExportChunk);   // full or diff
-  rpc Status(StatusRequest) returns (StatusResponse);       // sync lag, snapshots held
+  rpc Export(ExportRequest) returns (stream ExportChunk);               // a disk: full image or diff
+  rpc ExportObjects(ExportObjectsRequest) returns (stream ObjectChunk); // a bucket: every object
+  rpc Status(StatusRequest) returns (StatusResponse);
 }
+
 message ExportRequest {
   string owner = 1;
   string vid = 2;
   uint64 dseq = 3;               // the volume deployment on the EXPORTER's side
-  string requester = 4;          // destination provider address (must match mTLS cert)
-  string from_snapshot = 5;      // "" = full; else diff base (resumable/incremental)
+  string requester = 4;          // destination provider address (must match the mTLS client cert)
+  string from_snapshot = 5;      // "" = full; else the diff base
   uint64 resume_offset = 6;
 }
 message ExportChunk { bytes data = 1; bytes sha256 = 2; uint64 offset = 3; }
+
+message ExportObjectsRequest {
+  string owner = 1;
+  string vid = 2;
+  uint64 dseq = 3;
+  string requester = 4;
+  string start_after = 5;        // resume after the last object that landed
+}
+message ObjectAttributes {
+  uint64 size = 1;
+  string content_type = 2;
+  string content_encoding = 3;
+  string content_disposition = 4;
+  string content_language = 5;
+  string cache_control = 6;
+  string expires = 7;
+  map<string, string> metadata = 8;   // x-amz-meta-*
+}
+message ObjectChunk {
+  string key = 1;
+  ObjectAttributes attributes = 2;    // first chunk of an object only
+  uint64 offset = 3;
+  bytes data = 4;
+  bytes sha256 = 5;                   // this chunk
+  bytes object_sha256 = 6;            // last chunk of an object: the whole object
+}
+
+message StatusRequest { string owner = 1; string vid = 2; uint64 dseq = 3; string requester = 4; }
+message StatusResponse {
+  repeated string snapshots = 1;
+  string latest_snapshot = 2;
+  uint64 size = 3;
+  bytes sha256 = 4;                   // whole-image digest
+  int64 sync_lag_seconds = 5;
+  bool final = 6;                     // the source's lease is closed and nothing mounts the volume
+}
 ```
 
-mTLS with x/cert on-chain provider identities, both directions; authorization derived from chain state on both ends
-(see README [Migration](./README.md#migration)); per-chunk sha256 + whole-image digest in `StatusResponse`.
+Both transfer errors are `FailedPrecondition` with ErrorInfo domain `akash.network`: `VOLUME_IMPORT_INCOMPLETE` (the
+exporter's own copy never finished arriving; the destination tries the next-older holder) and `VOLUME_NOT_FINAL`
+(`ExportObjects` on a bucket that is not final yet; the destination asks again next round).
+
+### 2.8 Error Codes
+
+`deployment/v1` (chain-sdk):
+
+| Code | Error                      | gRPC code          |
+| ---- | -------------------------- | ------------------ |
+| 27   | `ErrVolumeOrdersDisabled`  | FailedPrecondition |
+| 28   | `ErrVidInUse`              | AlreadyExists      |
+| 29   | `ErrVidRetained`           | FailedPrecondition |
+| 30   | `ErrVolumeAttached`        | FailedPrecondition |
+| 31   | `ErrInvalidVolumeAdoption` | InvalidArgument    |
+| 32   | `ErrInvalidVolumeReplica`  | InvalidArgument    |
+
+Governance-bound failures use the existing `ErrInvalidParam` (22).
+
+`market` (node, `x/market/handler/errors.go`):
+
+| Code | Error                                | Meaning                                                  |
+| ---- | ------------------------------------ | -------------------------------------------------------- |
+| 100  | `ErrVolumeOrdersDisabled`            | volume orders disabled                                   |
+| 101  | `ErrVolumeReclamationWindowTooShort` | bid window below `min_volume_reclamation_window`         |
+| 102  | `ErrVolumeOfferMismatch`             | storage offer does not equal the order's quantities      |
+| 103  | `ErrVolumeAdoptionProvider`          | adoption bids are gated to the retaining provider        |
+| 104  | `ErrVolumeRefInvalid`                | invalid volume reference                                 |
+| 105  | `ErrVolumeNotColocated`              | the volume has no active lease with this provider        |
+| 106  | `ErrVolumeAttachmentLimit`           | attachment limit reached                                 |
+| 107  | `ErrVolumePolicyNotAccepted`         | the bid's volume policy does not match the order         |
+| 108  | `ErrVolumeNotAttachable`             | the volume is a bucket                                   |
+
+A repeated tenant close before the reclamation deadline reuses `ErrReclamationWindowNotElapsed` (38).
 
 ---
 
@@ -273,273 +378,449 @@ mTLS with x/cert on-chain provider identities, both directions; authorization de
 
 ```
 x/deployment store (existing key):
-  0x11  deployments   IndexedMap (existing)
-  0x12  groups        IndexedMap (existing) -- the volume's durable spec-of-record
-  0x13  volumesByVid  Map[Pair[owner, vid] -> GroupID]                     (NEW)
-        maintained on volume create / close / adopt; enforces per-owner vid
-        uniqueness among live volumes; resolves vid -> current volume
+  {0x13,0x01}  pending-denom map (existing)
+  {0x13,0x02}  volumes_by_vid         Map[Pair[owner, vid] -> GroupID]                  (NEW)
+               written on every volume create, adoption included; never removed:
+               whether the volume is live, retained, or expired is read from its group
+  {0x13,0x03}  volume_replica_counts  replica_of backrefs per primary volume            (NEW)
 
-x/market store (existing key):
-  0x12 orders, 0x13 bids, 0x14 leases (existing)
-  0x15  attachments     KeySet[Pair[GroupIDKey(volume), LeaseIDKey(compute)]]  (NEW)
-  0x16  attachmentsRev  KeySet[Pair[LeaseIDKey(compute), GroupIDKey(volume)]]  (NEW)
-        written/pruned ONLY inside the keeper (never handlers) so every close
-        path -- tenant, provider, escrow cascade -- maintains them; iteration
-        is deterministic (key order)
+x/market store (existing key; orders 0x11, bids 0x12, leases 0x13, params 0x14):
+  {0x15,0x00}  attachments     KeySet[Pair[(volume owner, dseq, gseq), compute LeasePrimaryKey]]  (NEW)
+  {0x16,0x00}  attachmentsRev  KeySet[Pair[compute LeasePrimaryKey, (volume owner, dseq, gseq)]]  (NEW)
+               written and pruned ONLY inside the keeper (never handlers), so every close
+               path -- tenant, provider, escrow cascade -- maintains them; iteration is
+               deterministic (key order)
 ```
 
-Both indexes ship with genesis export/import and ride the module `ConsensusVersion` bump migrations (empty at upgrade)
-from day one -- the network-upgrade CI job blocks release otherwise. `StoreLoader.Added` stays empty: no
-store-key-mount-on-exact-upgrade-name hazard. A small keeper counter beside the vid index tracks `replica_of` backref
-counts per volume.
+The indexes are not genesis fields: `InitGenesis` rebuilds them from groups and leases (`x/deployment/genesis.go`,
+`x/market/genesis.go`), and the upgrade handler rebuilds them the same way. No module changes its `ConsensusVersion`
+(deployment 8, market 9, escrow 3), no store migration is registered, and `StoreLoader.Added` stays empty: no
+store-key-mount-on-exact-upgrade-name hazard.
 
 ---
 
 ## 4. Chain Module Changes (`node`)
 
-No new module, no new stores, no new hooks, no EndBlocker anywhere. `app/types/app.go`, `app_configure.go`
-(`orderInitGenesis`), `modules.go`, `mac.go`, `SetupHooks` -- all untouched.
+No new module, no new stores, no new hooks, no EndBlocker anywhere. `app/` and every `module.go` are untouched.
 
-### 4.1 chain-sdk v1beta5 Go validation (ships in U1, inert behind the flag)
+### 4.1 chain-sdk `deployment/v1beta4` Go Validation (ships in U1, inert behind the flag)
 
-`validateResources` / `ResourceUnits.Validate` (`chain-sdk/go/node/deployment/v1beta5/resourceunit.go`):
+`groupspec.go`, `resourceunit.go`, `group_validation.go`, `msgs.go`:
 
-- `GroupSpec.Volume != nil` (volume groups): CPU/Memory/GPU **present-but-zero** (fields non-nil, values zero -- every
-  downstream dereference stays crash-safe); exactly one Storage entry with `persistent=true`, `class != ram`, size in
-  `[5Mi, params.MaxVolumeSize]`, `count == 1`; `ResourceUnit.Volumes` empty (a volume never references one); `vid`
-  grammar; `retention <= MaxVolumeRetention`; `max_attachments == 1`; `max_replicas <= MaxVolumeReplicas`;
-  `adopt`/`replica_of` mutually exclusive and stateless-validated.
-- `GroupSpec.Volume == nil` (compute groups): existing rules unchanged, plus each `VolumeRef` stateless-validated;
-  **no Storage entry corresponds to a VolumeRef** -- attached volumes contribute zero storage quantity, never
-  double-counted in compute inventory or pricing.
+- `GroupSpec.Volume != nil` (volume groups): one resource unit with ID > 0 and no endpoints; CPU/Memory/GPU
+  **present-but-zero** (fields non-nil, values zero -- every downstream dereference stays crash-safe); exactly one
+  named Storage entry with `persistent=true`, a `class` attribute other than `ram`, size in `[5Mi, 32Ti]`, and
+  `count == 1`; `ResourceUnit.Volumes` empty (a volume never references one); `vid` grammar; `reclaim` is `retain` or
+  `delete`; `access` is `mount` or `bucket`; retention >= 0. A disk has `max_attachments == 1`; a bucket has
+  `max_attachments == 0`, `max_replicas == 0`, and no `replica_of`. `adopt` and `replica_of` are mutually exclusive
+  and point at `gseq == 1`.
+- Governance bounds are a separate call, `GroupSpec.ValidateVolumeBounds(Params)` (size <= `max_volume_size`,
+  retention <= `max_volume_retention`, `max_replicas` <= `max_volume_replicas`), which the deployment handler runs.
+- `GroupSpec.Volume == nil` (compute groups): existing rules unchanged, plus each `VolumeRef` stateless-validated
+  (`gseq == 1`, unique within the unit). **No Storage entry shares a reference's name** -- attached volumes contribute
+  zero storage quantity, never double-counted in compute inventory or pricing.
 - `ValidateDeploymentGroups`: a deployment containing a volume group contains **only** that group (single-group
-  invariant => `gseq` always 1; escrow account == volume).
+  invariant => `gseq` always 1; escrow account == volume). `MsgCreateDeployment.ValidateBasic` also requires the
+  `adopt` and `replica_of` owners to equal the message owner.
 
-### 4.2 `x/deployment` (`node/x/deployment/handler/server.go`, `keeper/`)
+### 4.2 `x/deployment` (`node/x/deployment/handler/server.go`, `keeper/volume.go`)
 
 `CreateDeployment`, after existing validation, when the single group is a volume group:
 
-1. Feature flag: reject unless `market.Params.VolumeOrdersEnabled`.
-2. **vid gate:** look up `volumesByVid[owner, vid]` -- live volume => `ErrVidInUse`; retained dead volume within its
-   retention window => `ErrVidRetained` unless `VolumePolicy.adopt` names exactly that volume; expired/absent =>
-   fresh create, index (over)written.
-3. Adoption validation (`adopt` set): referenced group exists, is a volume group, owner matches, is closed, vid
-   matches, block time within the dead volume's retention window (read from its last closed lease's `ClosedAt` --
-   additive `closed_at` on the v1 lease record if not already present). Emits `EventVolumeAdopted`.
-4. Replica validation (`replica_of` set): target exists, is a live volume group, owner matches, backref count <
-   its `max_replicas`.
-5. Proceed exactly as today: `market.CreateOrder(...)` then
-   `escrow.AccountCreate(deployment.ID.ToEscrowAccountID(), ...)` -- the volume's migration window rides the
-   existing `Reclamation` field of `MsgCreateDeployment`.
+1. Feature flag: reject unless `VolumeOrdersEnabled` (27).
+2. Governance bounds: `ValidateVolumeBounds(params)` (22).
+3. **vid gate:** look up `volumes_by_vid[owner, vid]`. A holder group that is open or paused => `ErrVidInUse` (28). A
+   holder that is closed or `insufficient_funds` and still within its retention window, counted from the `closed_at`
+   of its most recently closed lease => `ErrVidRetained` (29) unless `VolumePolicy.adopt` names exactly that volume.
+   Otherwise a fresh create, and the entry is (over)written.
+4. **Adoption** (`adopt` set): the referenced group exists, is a volume group of the same owner, is closed or
+   `insufficient_funds`, has the same `vid` and `access`, has a storage entry named as the reference, is no larger
+   than the new volume, and block time is within its retention window; else `ErrInvalidVolumeAdoption` (31). The
+   keeper emits `EventVolumeAdopted`.
+5. **Replica** (`replica_of` set): the target exists and is a live disk volume group (not a bucket) of the same owner,
+   with a storage entry named as the reference, no larger than the new volume, and with a replica count below its
+   `max_replicas`; else `ErrInvalidVolumeReplica` (32). The count drops when the replica closes.
+6. Proceed exactly as today: `market.CreateOrder(...)` then the escrow account. The deployment's `Reclamation` field
+   stays optional; the floor is enforced on the bid.
 
-`CloseDeployment`/`CloseGroup` on a volume: reject with `ErrVolumeAttached` while the attachment index has entries
-(narrow market-keeper method `HasAttachments(groupID)`); tenants close compute first. The escrow cascade cannot be
-blocked -- it cascade-detaches instead (4.4).
+`CloseDeployment`, `CloseGroup`, and `PauseGroup` on a volume: rejected with `ErrVolumeAttached` (30) while the
+attachment index has entries for it -- tenants close compute first. Otherwise the volume lease enters reclamation with
+`volume_closed_retain`. The escrow cascade cannot be blocked; it cascade-detaches instead (4.4).
 
-### 4.3 `x/market` (`node/x/market/handler/server.go`, `keeper/`)
+### 4.3 `x/market` (`node/x/market/handler/server.go`, `keeper/keeper.go`, `keeper/volume.go`)
 
-`msgServer.CreateBid` -- additive checks after the existing reclamation block (`handler/server.go:104-121`):
+`msgServer.CreateBid` on a volume order, in this order:
 
-1. Volume-group bids: flag check; `msg.ReclamationWindow >= params.MinVolumeReclamationWindow`; `ResourcesOffer`
-   storage quantities **equal** the order's per-name quantities (closes the `MatchGSpec` boundary TODO,
-   `chain-sdk/go/node/market/v2beta1/bid.go`, *for volume orders only* -- the global compute fix is out of scope);
-   capability matching rides `order.MatchResourcesRequirements` unchanged (the SDL injects
-   `capabilities/storage/volumes: "true"` into `PlacementRequirements`). Adoption orders: additionally
-   `msg.ID.Provider == provider of the dead volume's most recent closed lease` -- pure chain state.
-2. Attaching-group bids (any `ResourceUnit.Volumes` non-empty), per ref: group exists, is a volume group,
-   `ref.owner == order.ID.Owner`; an **active** lease exists on the volume group with
-   `lease.ID.Provider == msg.ID.Provider` (colocation -- reads *current* state, so it survives the auto-re-order loop
-   and migration for free); attachment count < `max_attachments` -- O(1) prefix count, not a lease scan.
+1. flag (100);
+2. `msg.VolumePolicy` equals the order's policy (107);
+3. `msg.ReclamationWindow >= params.MinVolumeReclamationWindow` (101);
+4. `ResourcesOffer` storage quantities **equal** the order's per-name quantities (102);
+5. adoption orders: `msg.ID.Provider` equals the provider of the dead volume's most recently closed lease, ordered by
+   close height then oseq -- pure chain state (103).
 
-`msgServer.CreateLease` -- attaching groups: **re-verify** colocation and the attachment bound, then write both index
-directions and emit `EventVolumeAttached`. Volume groups: nothing special.
+A bid that carries a volume policy on a non-volume order is rejected. Capability matching rides
+`order.MatchResourcesRequirements` unchanged (the SDL injects the capability attribute into the placement
+requirements).
 
-**Shared keeper close routine** (reached by `MsgCloseLease`, `MsgCloseBid`, and escrow hooks via `OnGroupClosed`), at
-the single point where `EventLeaseClosed` is emitted:
+Attaching-group bids (any `ResourceUnit.Volumes` non-empty), per reference: the group exists, is a volume group of
+the order's owner, and has a storage entry of the referenced name (104); it is not a bucket (108); it has a lease in
+state `Active` whose provider is the bidder, so a volume in reclamation refuses new attaches (105) -- colocation reads
+*current* state, so it survives the re-order loop and migration for free; its attachment count is below
+`max_attachments` (106).
+
+`msgServer.CreateLease` re-runs every attach check; the keeper then writes both index directions and emits
+`EventVolumeAttached`.
+
+**Shared keeper close routine** (`keeper.go`), reached by `MsgCloseLease`, `MsgCloseBid`, the escrow hooks
+(`OnEscrowPaymentClosed`, `OnGroupClosed`), and `CloseGroup`/`PauseGroup`, at the single point where
+`EventLeaseClosed` is emitted:
 
 - Closing lease in `attachmentsRev` (a compute attach): prune both directions, emit `EventVolumeDetached{reason}`.
-- Closing lease is a volume lease: cascade-detach then reason substitution (4.4).
+- Closing lease is a volume lease: cascade-detach, then reason substitution (4.4).
 
-**Tenant volume close routes through reclamation:** `MsgCloseDeployment` on an unattached volume and `MsgCloseLease`
-on a volume lease enter `LeaseReclaiming` with
-`deadline = now + max(bid.ReclamationWindow, params.MinVolumeReclamationWindow)`; the close completes at msg time after
-the deadline (the existing `MsgCloseBid` state gate, generalized to the tenant direction for volume groups).
+**Tenant volume close routes through reclamation.** `MsgCloseLease` on a volume lease calls `ReclaimVolumeOnClose`
+with `volume_migrate`: the first close enters `LeaseReclaiming` with
+`deadline = now + max(bid.ReclamationWindow, params.MinVolumeReclamationWindow)` and closes nothing; a close after
+the deadline completes it and the group re-orders; a close before the deadline fails with
+`ErrReclamationWindowNotElapsed` (38). The deployment and group closes of 4.2 route the same way with
+`volume_closed_retain`.
 
-**Auto-re-order carve-out:** the existing still-open-group re-order loop is kept for `volume_migrate`/`volume_evict`
-(it *is* the migration re-listing); terminal closes (`volume_unfunded` => group `insufficient_funds`; deployment
-closed) fire no re-order -- adoption takes over.
+**Re-order carve-out:** provider reclaim with `volume_evict` or `volume_migrate` keeps the existing still-open-group
+re-order loop (it *is* the move's re-listing). Any other provider reclaim reason on a volume pauses the group without a
+re-order, and the lease records that reason. Terminal closes (`volume_unfunded` => group `insufficient_funds`;
+`volume_closed_retain` => group closed) fire no re-order -- adoption takes over.
 
 ### 4.4 Cascade-Detach (keeper close routine, every path)
 
 Invariant: a volume lease never reaches `closed` while the attachment index holds entries for its group.
 
-1. Reclaim completion (provider `MsgCloseBid` after deadline; tenant close after its window): iterate the volume's
-   attachments in deterministic key order, force-close each attached compute lease with `reason_volume_detach` (normal
-   compute close path per lease: payment closed, event emitted, its group auto-re-orders), then close the volume lease
-   with the substituted volume reason.
-2. Escrow exhaustion (`OnEscrowAccountClosed -> close deployment -> OnGroupClosed`): same cascade-detach inline, then
-   close with `reason_volume_unfunded`. Deterministic, single-tx.
-3. Final assert-empty on the volume's attachment entries guards the invariant.
+1. Reclaim completion (provider `MsgCloseBid` after the deadline; tenant close after its window): iterate the
+   volume's attachments in deterministic key order, force-close each attached compute lease with
+   `reason_volume_detach` (normal compute close path per lease: payment closed, event emitted, its group re-orders),
+   then close the volume lease with the substituted volume reason.
+2. Escrow exhaustion: payments are saved before the account, so `OnEscrowPaymentClosed` reaches the routine first; it
+   runs the same cascade-detach inline, then closes with `reason_volume_unfunded`. Deterministic, single-tx.
+3. A final assert-empty on the volume's attachment entries guards the invariant (`keeper/volume.go`).
 
-Bounded: at most `max_attachments` (=1 in v1) extra closes per volume -- O(1), gas-accounted.
+While a compute lease is attached, the tenant's only close path is `MsgCloseLease` (a move); deployment, group, and
+pause closes are rejected. Bounded: at most `max_attachments` (= 1 in v1) extra closes per volume -- O(1),
+gas-accounted.
 
 ### 4.5 Escrow (`node/x/escrow/keeper/keeper.go`)
 
-- `EventAccountRunway` emitted at the end of `accountSettle` for any account with open payments:
-  `projected_depletion_height = current + floor(Funds[0] / sum(open payment rates))`. No state change; generic across
-  scopes.
-- Preserved by not touching: the d7d0205d payments-before-account save ordering; `AccountDeposit`/overdraw semantics;
-  AEP-75 FIFO drain and grant re-credit; single-denom uact settlement.
+- `EventAccountRunway` is emitted at the end of `accountSettle` when the settle covers at least one new block and
+  leaves the account funded: `projected_depletion_height = current + floor(Funds[0] / sum(open payment rates))`. No
+  state change; generic across scopes.
+- Preserved by not touching: the payments-before-account save ordering; `AccountDeposit`/overdraw semantics; AEP-75
+  FIFO drain and grant re-credit; single-denom uact settlement.
 
 ---
 
 ## 5. Provider Changes
 
-### 5.1 StorageClasses
+### 5.1 StorageClasses (`helm-charts`, `akash-storage-operator`)
 
-The storage-operator Helm chart installs akash-labeled `-retain` StorageClasses per class (`beta1-retain` ...
-`beta3-retain`; `reclaimPolicy: Retain`, same provisioners -- the `akash-nodes-storageclass.yaml` precedent) and
-appends them to the `akash.network/storageclasses` node label. **Invariant: every PV backing a volume group is created
-`reclaimPolicy: Retain` at provision time.** The AEP-15 per-lease path keeps its Delete classes untouched.
+The chart installs akash-labeled `beta1-retain`, `beta2-retain`, and `beta3-retain` StorageClasses (RBD,
+`reclaimPolicy: Retain`, `helm.sh/resource-policy: keep`), a node labeler that appends them to the
+`akash.network/storageclasses` node label, and the `akash-volumes` namespace. **Invariant: every PV backing a volume
+group is created from a retain class.** The AEP-15 per-lease path keeps its Delete classes untouched. The provider
+offers the classes listed in `--volume-classes`, which must name classes with a `-retain` variant; the operator picks
+the class by name and does not re-check its reclaim policy.
 
 ### 5.2 Storage Operator (`provider/operator/storage/`)
 
-New cobra subcommand (one `AddCommand` line in `operator/cmd.go`; clientsets, errgroup, pubsub free from the parent
-PreRun) -- the CRD-reconciler archetype (hostname/ip operator model). Replicas:1; all state re-derivable from
-CRDs + PVs + chain queries; nothing only-in-memory.
+A cobra subcommand, `provider-services operator storage` -- the CRD-reconciler archetype (hostname/ip operator
+model). One replica; all state re-derivable from CRDs, PVs, and chain queries; nothing only-in-memory.
 
-**Volume CRD** (`pkg/apis/akash.network/v2beta2`, modeled on `provider_host.go`; clientset regenerated; added to
-`crd.yaml` upload paths). Name: `volume-<sha256(owner/vid)[:12]>`. Spec: owner, vid, groupId, class, size, reclaim,
-retention, leaseId. Status: `phase` (`Pending|Provisioned|Attached|Retained|Adopting|Exporting|Releasing`), `pvName`,
-`attachedLease`, `retainedUntil` (= closedAt + retention -- the GC ledger).
+**Volume CRD** `volumes.akash.network` (group `akash.network`, version `v2beta2`, kind `Volume`, short name `vol`),
+namespaced in `--k8s-manifest-ns` (default `lease`). Name: `volume-<sha256(owner/vid)[:12]>`; every lookup by name
+also checks owner and vid. Spec: owner, vid, groupId, class, size, reclaim, retention, leaseId, access, importFrom.
+Status: `phase`, `pvName`, `attachedLease`, `retainedUntil`, `localCopy`, and for buckets `bucket`, `bucketDSeq`,
+`bucketSize`. Phases: `Pending`, `Importing`, `Provisioned` (parked), `Attached`, `Exporting`, `Adopting`, `Retained`,
+`Releasing`.
 
 **PV choreography -- never through `Available`** (PVCs are namespaced; PVs are cluster-scoped; the volume's durable
 kube object is the PV):
 
-- *Provision*: holder PVC `<crd-name>` in namespace `akash-volumes` against the `-retain` class, pinning
-  `spec.volumeName` once bound; PV labeled `akash.network/volume-owner|vid|dseq`. State Provisioned/Parked.
+- *Provision*: holder PVC `<crd-name>` in `--volumes-namespace` (default `akash-volumes`) against the retain class;
+  the provisioner binds a new PV to it. PV labeled `akash.network/volume-owner|vid|dseq`. Phase `Provisioned`.
 - *Attach*: create the target PVC in the compute lease namespace **first** (with `spec.volumeName`), patch
-  `pv.spec.claimRef` **directly to the target PVC** (name+namespace+UID), then delete the holder PVC. The PV is never
-  an unclaimed `Available` Retain PV the kube binder could hand to an arbitrary pending PVC -- the cross-tenant
-  re-bind race is closed by construction.
-- *Detach* (compute namespace deleted; PV `Released`): recreate holder PVC, patch `claimRef` back. Parked.
-- *Retain*: stamp `retainedUntil`. *Adopt*: verify chain state (the adoption deployment's `VolumePolicy.adopt` matches
-  this CRD's dead groupId), update `spec.groupId/leaseId`, re-park. A Released PV is never adopted for a different
-  owner.
-- *GC*: delete PV + RBD image only when `now > retainedUntil` **and** phase not in {Exporting, Adopting};
-  `reclaim: delete` volumes GC immediately after close+detach. **The single destruction path**, driven by a positive
-  chain-computable deadline -- never by `EventLeaseClosed` inference.
+  `pv.spec.claimRef` **directly to the target PVC** (name, namespace, UID), then delete the holder PVC. The PV is never
+  an unclaimed `Available` Retain PV the kube binder could hand to an arbitrary pending PVC -- the cross-tenant re-bind
+  race is closed by construction.
+- *Detach*: when `status.attachedLease` is cleared -- by the daemon's `DetachVolume` at lease teardown, by the compute
+  lease's `EventLeaseClosed` or `EventVolumeDetached`, or by a resync that finds the lease inactive -- recreate the
+  holder PVC, patch `claimRef` back to it, then delete the stale attach PVC. Phase `Provisioned`.
+- *Retain*: stamp `retainedUntil` = the time the operator observed the close + retention (it does not read the
+  lease's `closed_at`, so its deadline falls at or after the chain's). *Adopt*: verify chain state (the adopting
+  deployment's `VolumePolicy.adopt` matches this volume), update `spec.groupId/leaseId`, re-park. A released PV is
+  never adopted for a different owner.
+- *GC*: only from `Retained` or `Releasing`, once `retainedUntil` has passed: flip the PV to `Delete`, delete the PVC
+  and PV (the RBD image goes with it), then the CRD. A `reclaim: delete` volume goes to `Releasing` at close with
+  `retainedUntil = now`. **The single destruction path** -- never directly on `EventLeaseClosed`.
 
-**Chain watch:** subscribes to `EventLeaseClosed` (volume reasons), `EventVolumeAttached/Detached`,
-`EventVolumeAdopted`; re-lists on restart with its **own** pagination checkpoint key -- never sharing the bidengine's
-`GetOrdersNextKey`.
+**Chain watch:** its own CometBFT `NewBlockHeader` subscription plus block results, decoding transaction and
+finalize-block events: `EventLeaseClosed` (all reasons), `EventLeaseReclaimStarted` (`volume_evict` and
+`volume_migrate` only), `EventVolumeAttached`/`Detached`, and `EventVolumeAdopted`. A resync walks this provider's
+active leases at start and every `--resync-interval` (default 5m), with no saved cursor and nothing shared with the
+bid engine's order discovery.
+Without chain access the operator runs degraded: adoptions freeze and re-listed volumes stay `Pending`.
 
-**Daemon wiring:** storage-operator client under `cluster/kube/operators/clients/`, `clfromctx` key, appended to
-`waitClients` as `waiter.Waitable` -- mandatory only when the provider advertises `capabilities/storage/volumes`
-(config-gated), so non-participants gain no chart-before-daemon ordering constraint. Helm chart cloned from
-`akash-inventory-operator` with matching discovery labels; RBAC adds PV/PVC create/delete, `volumes.akash.network`,
-`snapshot.storage.k8s.io`, and rook-ceph-tools exec. Rook absence tolerated via the `crdInstalled` polling pattern.
+**Daemon wiring:** the daemon reaches the operator's REST API (`/health`, `/state`, `/volume/{owner}/{vid}`) at
+`--storage-operator-endpoint` and waits for it at startup only when the provider takes part in the volume market (the
+capability attribute, volume classes, or a bucket backend), so non-participants gain no chart-before-daemon ordering
+constraint. Other operator flags: `--provision-node-hint` (annotate provisioning claims with the selected node, for
+node-constrained provisioners) and `--node` (chain RPC). Helm chart cloned from `akash-inventory-operator` with
+matching discovery labels; RBAC covers PVs, PVCs, and `volumes.akash.network`.
 
-**Inventory truth (three legs, all required):** (1) volume allocations published as long-lived allocated entries into
-the inventory operator's merged cluster state (a `storageSignal` on the existing merge loop) so parked/retained volumes
-are never double-counted as free; (2) rebuilt from Volume CRDs on restart; (3) `inventory.v1.StorageInfo` extended
-additively only (`volumes_capable bool`, `retained_bytes uint64`).
+**Inventory truth:** (1) the inventory operator publishes volume allocations per class into its merged cluster state,
+counting every phase except `Releasing` (`operator/inventory/volumes.go`), so parked, retained, and moving volumes are
+never double-counted as free; (2) it rebuilds them from Volume CRDs on restart; (3) the storage operator reports
+retained bytes on its `/state` endpoint.
 
 ### 5.3 Cluster Layer (`provider/cluster`, `cluster/kube`)
 
-- `cluster.Client` (`cluster/client.go:63`) gains `DeployVolume / AttachVolume / DetachVolume / TeardownVolume /
-  VolumeStatus` (nullClient stubs included); implementations delegate to the Volume CRD -- the daemon never
-  manipulates PVs directly.
-- `Deploy`'s persistent switch (`kube/client.go:~570`) gains a third case: a service with a volume ref renders as a
-  k8s `Deployment` (not StatefulSet -- positional per-replica VolumeClaimTemplates don't apply), `replicas=1`, pod
-  volume by pre-bound `ClaimName` -- resolving the `DataSource: nil` seam in `Workload.persistentVolumeClaims()`
-  (`kube/builder/workload.go:226`).
+- `cluster.Client` (`cluster/client.go`) gains `DeployVolume`, `AttachVolume`, `DetachVolume`, `TeardownVolume`,
+  `VolumeStatus`, `LeaseVolume`, and `DeployedVolumes` (nullClient stubs included); implementations go through the
+  Volume CRD -- the daemon never manipulates PVs directly. `DeployVolume` on a re-listed order resets the record to
+  `Pending`.
+- The daemon drives attach: `AttachVolume` runs before `Deploy` and refuses a volume attached to another lease or
+  still importing.
+- `Deploy` renders a service with a volume reference as a k8s `Deployment` (not a StatefulSet -- positional
+  per-replica VolumeClaimTemplates don't apply), `replicas=1`, mounting the attach PVC by claim name.
 - `TeardownLease` is **unchanged** -- namespace deletion removes only the attach PVC; the Retain PV survives and the
   operator re-parks it. Deploy-failure rollback is equally harmless.
 - Volume objects carry `akash.network/component: volume` labels excluded from `cleanupStaleResources`' selector.
-- Reservations: `ctypes.Reservation` gains a **durable** kind -- counted by `inventory.Adjust`'s per-class `SubNLZ`,
-  `StorageCommitLevel` forced to 1.0 (durable leased bytes never thin-sold), exempt from unreserve-on-lease-close
-  (released only on volume GC), rebuilt on restart from Volume CRDs. `inventoryService.reserve`'s nil-unit
-  hard-rejects (`cluster/inventory.go:185`) are satisfied by the present-but-zero shape -- no relaxation needed.
+- Reservations: `ctypes.Reservation` gains a **durable** kind, counted by `inventory.Adjust` per class, with commit
+  levels skipped for the whole volume group (durable leased bytes are never thin-sold), exempt from
+  unreserve-on-lease-close, and rebuilt on restart from Volume CRDs. A released volume's durable reservation is dropped
+  at the next restart; until then the inventory operator's allocation (5.2) carries the capacity truth.
+- Manifests: the manifest manager rejects an upload for a deployment whose leases on this provider are all volume
+  leases, and never sends one to a volume lease.
 
 ### 5.4 Bid Engine (`provider/bidengine`)
 
-- **Discovery: zero changes.** Volume orders are ordinary `EventOrderCreated`/`OrderOpen` (v2beta1); `newOrder`
-  (`order.go`) forks on `gspec.Volume != nil`.
-- **Volume `shouldBid`:** skip CPU/GPU/endpoint gates; keep placement/audit gates; require the class in advertised
-  capabilities **and** live per-class headroom from the retained `inventory.Cluster` (closing the
-  `provider_attributes.go:162` TODO for the storage path); require the `-retain` class installed; check provider caps
-  (max size, max retention honored, replication support). Adoption orders: local pre-check for a Retained Volume CRD
-  matching owner/vid (the chain gate is the authority).
-- **Pricing:** `scalePricing` per-class map applies (compute terms zero); `shellScriptPricing`'s `storageElement`
-  gains additive `volume, retention_hours, max_replicas, replica` fields (+ `run.go` flags).
-- **Win handoff:** `VolumeLeaseWon` bus event -> volume provisioner (creates the Volume CRD; **no manifest wait** --
-  the GroupSpec is the whole contract). `checkForExistingBid` restart recovery applies unchanged.
-- **Attach orders:** ordinary compute path plus a local check that each ref matches a Parked Volume CRD; attach
-  storage contributes zero quantity -- no reservation double-count.
+- **Discovery: zero changes.** Volume orders are ordinary `EventOrderCreated`/`OrderOpen` on `market.v1beta5`;
+  `order.run` forks on `GroupSpec.Volume != nil`.
+- **Volume gates** (`volume.go`): placement, audit, and capability checks; the class in `--volume-classes` (or
+  `--bucket-classes` for a bucket, which also needs a bucket backend); size <= `--volume-max-size`; retention <=
+  `--volume-max-retention`; `max_replicas` <= `--volume-max-replicas`, and a `replica_of` order needs a nonzero cap.
+  Both caps default to 0, which declines any order with retention or replicas. The engine waits up to two minutes for
+  the first inventory snapshot, then requires live per-class headroom. Adoption orders: a local pre-check for a `Retained` Volume of the same owner and vid, or one
+  already `Adopting` or `Provisioned` for the same dseq (the chain gate is the authority).
+- **Bids** carry the order's `VolumePolicy` and the provider-wide `--reclamation-window`, which must be at least the
+  chain floor for volume bids to land. Bids on a re-listed order (a move or an eviction) stay open for
+  `--volume-move-bid-timeout` (default 168h), so the tenant has time to choose the next provider.
+- **Pricing:** the shell-script strategy's `storageElement` gains `volume`, `retention_hours`, `max_replicas`, and
+  `replica`; scale pricing prices a volume's storage by class. A bucket is priced as a volume of its class.
+- **Win handoff:** a `VolumeLeaseWon` bus event reaches the volume provisioner, which creates the Volume CRD and adds
+  the lease to the withdrawal loop -- **no manifest wait**; the GroupSpec is the whole contract. `checkForExistingBid`
+  restart recovery applies unchanged.
+- **Attach orders:** the ordinary compute path plus a local check that each reference names a `Provisioned`,
+  unattached Volume of the order's owner and the reference's name as vid; attached storage contributes zero quantity --
+  no reservation double-count.
 
-### 5.5 Replication Drivers
+### 5.5 Transfer Service, Moves, and Replication
 
-`ReplicationDriver` interface; two implementations:
+**Service.** The provider daemon serves `VolumeTransfer` on its gateway gRPC port (`--volume-transfer-port`, default
+8444) whenever it takes part in the volume market, over mutual TLS 1.3 with x/cert provider certificates; a request's
+`requester` must equal the client certificate's CN. A client pins the server certificate to the source's on-chain
+identity and dials the host of the source's host URI at the transfer port, unless `--volume-transfer-endpoints` names
+another address for that provider.
 
-1. **`stream-export` (default, required):** CSI `VolumeSnapshot` -> `rbd export` / `rbd export-diff` (via the existing
-   `RemotePodCommandExecutor` against rook-ceph-tools; plain file copy for local-path) streamed over `VolumeTransfer`.
-   No Ceph cluster peering, no WAN-exposed mons, no pool-scoped cephx credentials. The mainnet posture.
-2. **`rbd-mirror` (opt-in):** snapshot-mode rbd-mirror for mutually trusting provider pairs, only with per-volume RBD
-   namespaces (or dedicated pools) and namespace-scoped peer users -- bootstrap peer tokens are pool-level credentials
-   and treated as such. Disabled by default.
+**Authorization** (`operator/storage/replication/authz.go`), derived from chain state on both ends: the exporter
+serves a requester holding an active lease on the same owner, vid, and dseq, or the provider of a replica whose
+`replica_of` names this volume. The importer accepts a source that held a lease on a volume of the same owner and vid
+(active, reclaiming, closed, or unfunded), starting with the latest provider whose lease closed with `volume_migrate`
+or `volume_evict`.
 
-Migration flow: on `EventLeaseReclaimStarted{volume_evict|volume_migrate}`, source CRD -> Exporting (GC frozen);
-destination pulls full export, then periodic diffs, final `export-diff` after cascade-detach/quiesce; destination flips
-its CRD to Parked. If import fails, the destination closes its bid and the order re-lists; the source holds data
-through window + retention.
+**Final.** A source is final when its own latest lease on the volume is closed, no pod mounts the claim, and no
+VolumeAttachment remains; `Status.final` reports it.
+
+**Driver `stream-export`** (default, `--volume-replication-driver`):
+
+- RBD-backed PVs: `rbd snap create` (`@akash-xfer-<UTC>`), then `rbd export` or `rbd export-diff`, run in the
+  rook-ceph-tools pod (`--volume-replication-rook-namespace`, default `rook-ceph`); import is `rbd rm` then
+  `rbd import`.
+- Other PVs (e.g. local-path): a tar of the volume's host-path tree, staged under `--volume-replication-dir`; always a
+  full copy.
+- Integrity: 1 MiB chunks, each with its sha256; the image is checked against the whole-image digest; transfers
+  resume from the last offset (up to 5 attempts); an import is capped at 1.5 x size + 64 MiB.
+
+`rbd-mirror` is a registered driver name without an implementation; selecting it fails provider startup.
+
+**A move, as run:**
+
+1. Reclaim starts (`EventLeaseReclaimStarted` with a move reason): the source Volume goes to `Exporting`; its workload
+   keeps running.
+2. At the deadline the provider daemon's volume reclaimer (a 30-second sweep) closes the lease with `MsgCloseBid`,
+   unless the tenant's own close got there first. The chain cascade-detaches and re-lists the order. The source stays
+   `Exporting` until the observed close + retention, then goes `Retained`, then is released.
+3. The winner's operator records `importFrom` from chain and provisions the volume as `Importing`. Its daemon pulls
+   every `--volume-migration-interval` (default 1m) until the source reports final, copies the final image or objects,
+   and parks the volume as `Provisioned`.
+4. A source whose own copy never finished arriving answers `VOLUME_IMPORT_INCOMPLETE`, and the destination tries the
+   next-older holder. After about 30 minutes of failed rounds, the destination starts a `volume_evict` reclaim on its
+   own lease, and the order re-lists again.
+
+The source's GC freeze ends at `retainedUntil` whether or not a copy finished.
+
+**Replication.** The export authorization serves replica providers, and the replica sync loop (`RunReplica`: an
+initial full export, then periodic diffs every `--volume-replica-sync-interval`, default 15m) is implemented, but the
+daemon does not start it yet (see §9).
+
+### 5.6 Buckets (`provider/bucket`, storage operator)
+
+**Backend.** A `bucket.Backend` interface (`Ensure`, `Suspend`, `Resume`, `Delete`, `Seal`, `Objects`, key create,
+list, and revoke, `Usage`) keeps the S3 server pluggable; v1 ships Ceph RGW through its Admin Ops API. Providers with
+persistent storage already run Rook-Ceph, so enabling buckets is adding an object store. A conformance suite runs
+against an in-memory fake and, under the `rgw_integration` build tag, a live RGW.
+
+**Mapping onto RGW**, for the Volume CRD `volume-<sha256(owner/vid)[:12]>`:
+
+| RGW object          | Value                                                                                   |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| user uid            | the CRD name -- stable across leases, so adoption keeps the data                        |
+| user display name   | `owner/vid`, checked on every call, so a colliding uid never reaches another volume     |
+| user quota          | `max-size` = the leased size; writes past it fail                                       |
+| user `max-buckets`  | 1 while the provider creates the bucket, then -1 (no key can create a bucket)           |
+| bucket              | `<vid, cut to 46>-<hex16(sha256(owner/vid))>`, owned by the user                        |
+| bucket policy       | deny `s3:DeleteBucket` to everyone (the admin API that GC uses is not subject to it)    |
+| public access block | `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`                        |
+| tenant keys         | sub-users with `read` or `readwrite` access (never `full`), at most 20 per bucket       |
+
+The provider creates and guards the bucket with a key it drops before returning, so it keeps no key to tenant data.
+
+**Lifecycle:**
+
+| Event                    | Bucket                                                                                   |
+| ------------------------ | ---------------------------------------------------------------------------------------- |
+| lease won                | `Ensure` (user, quota, bucket, guard); `Provisioned`                                     |
+| reclamation window       | keeps serving (the lease is still paid)                                                  |
+| lease closed (no move)   | `Suspend` (every key stops); `Retained`, or `Releasing` for `delete`                     |
+| lease closed (move)      | sealed on every pass: every sub-user revoked, the user left unsuspended so the provider can still read it; `Exporting` until close + retention |
+| adoption                 | waits for the adopting lease, then revokes every old key and resumes                     |
+| `retainedUntil` passed   | delete the bucket, its objects, and the user                                             |
+
+**Moves:** `ExportObjects` serves a bucket only once it is final (its lease closed and no key left), else
+`VOLUME_NOT_FINAL`. The destination provisions the bucket as `Importing`, refuses new keys (409) until the copy lands,
+empties its own bucket once on the first chunk (it may hold an older copy of its own), spools each object to disk,
+verifies every chunk and the whole object, and writes it with its attributes (objects past 256 MiB as 64 MiB multipart
+parts, aborted on any failure). A broken stream resumes after the last object that landed. A provider that held the
+bucket before and wins it back revokes its earlier keys, lifts the suspension, and imports the newer objects. Not
+carried: keys, object tags, ACLs, versions, and incomplete multipart uploads.
+
+**Configuration:** `--bucket-backend rgw` enables buckets, and the provider advertises `capabilities/storage/buckets`
+in its on-chain attributes. `--bucket-classes` names the classes whose capacity backs buckets; `--bucket-endpoint` is
+the public S3 URL tenants get (`https` only, unless `--bucket-allow-insecure-endpoint` for local development);
+`--bucket-region` (default `default`) is the region clients sign with; `--bucket-admin-endpoint` is the in-cluster
+RGW admin URL. Admin credentials come from `AP_BUCKET_ADMIN_ACCESS_KEY` and `AP_BUCKET_ADMIN_SECRET_KEY`. The public
+endpoint must refuse `/admin`, or serve an S3-only RGW.
+
+### 5.7 Gateway, CLI, and Flags
+
+Gateway routes on the lease subrouter (`/lease/{dseq}/{gseq}/{oseq}`; the lease ID is built from the authenticated
+caller, so only the owner can address it):
+
+| Route                           | JWT scope     | Result                                                              |
+| ------------------------------- | ------------- | ------------------------------------------------------------------- |
+| `GET /volume`                   | `status`      | phase, size, `import_from`, attached lease, `retained_until`        |
+| `GET /bucket`                   | `bucket`      | endpoint, bucket, region, size, usage, keys (never secrets)         |
+| `POST /bucket/keys`             | `bucket-keys` | `{name, access}` -> the key, with its secret, once                  |
+| `DELETE /bucket/keys/{keyName}` | `bucket-keys` | 204                                                                 |
+
+The bucket routes answer only on the bucket's own lease. New keys need the bucket `Provisioned` under that lease, so
+they are refused (409) while it is importing, in reclamation, closed, or being adopted; revoking is always allowed.
+The gateway serializes key changes.
+
+Provider CLI: `provider-services volume status --dseq --gseq --oseq --provider`; `provider-services bucket info`;
+`provider-services bucket key create <name> [--access readwrite|read]`; `provider-services bucket key revoke <name>`.
+
+Provider daemon flags:
+
+| Flag                                  | Default         | Meaning                                                          |
+| ------------------------------------- | --------------- | ---------------------------------------------------------------- |
+| `--volume-classes`                    | none            | storage classes offered as volumes (each with a `-retain` class) |
+| `--volume-max-size`                   | 0 (no cap)      | largest volume to bid on, in bytes                               |
+| `--volume-max-retention`              | 0               | longest retention honored; orders asking more are declined       |
+| `--volume-max-replicas`               | 0               | highest replica count honored; 0 declines replication terms      |
+| `--reclamation-window`                | 0               | window offered in bids; volume bids need at least the chain floor |
+| `--volume-move-bid-timeout`           | 168h            | how long a bid on a re-listed volume order stays open            |
+| `--volume-migration-interval`         | 1m              | period between copy-in rounds for a volume moving here           |
+| `--volume-transfer-port`              | 8444            | port other providers dial for transfers (the gateway gRPC port)  |
+| `--volume-transfer-endpoints`         | none            | `provider=host:port` overrides for where a provider serves transfers |
+| `--volume-replication-driver`         | `stream-export` | transfer driver                                                  |
+| `--volume-replication-rook-namespace` | `rook-ceph`     | namespace of the rook-ceph-tools pod that runs `rbd`             |
+| `--volume-replication-dir`            | OS temp dir     | staging for file-tree copies                                     |
+| `--volume-replica-sync-interval`      | 15m             | period between replica pulls (not used yet, §9)                  |
+| `--bucket-backend`                    | none            | `rgw` enables buckets                                            |
+| `--bucket-classes`                    | none            | classes whose capacity backs buckets                             |
+| `--bucket-endpoint`                   | none            | public S3 URL (`https`)                                          |
+| `--bucket-region`                     | `default`       | region clients sign with                                         |
+| `--bucket-admin-endpoint`             | none            | in-cluster RGW admin URL                                         |
 
 ---
 
 ## 6. SDL and CLI (`chain-sdk`)
 
-- SDL v2.2 package (`sdl/v2_2`): top-level `volumes:` stanza; `buildGroups()` compiles a volume entry to
-  `GroupSpec{Volume: &VolumePolicy{...}, Resources: [present-but-zero + one Storage, count 1]}` and injects
-  `capabilities/storage/volumes: "true"` into `PlacementRequirements`. No lifecycle/vid data ever enters
-  `Storage.Attributes`. Service-level `volume:` params compile to `ResourceUnit.Volumes` refs on-chain and
-  `StorageParams.volume` strings in the v2beta4 manifest -- identical content both sides for `checkAgainstGSpec`.
+- SDL v2.2 lives in package `sdl` (`go/sdl/v2_2.go`, `groupBuilder_v2_2.go`). `buildVolumeGroup` compiles a
+  `volumes:` entry to a single-group deployment: the group named after the placement; one resource unit with
+  present-but-zero compute and one Storage entry named after the volume key (the `vid`) with attributes `class` and
+  `persistent=true`; and `GroupSpec.Volume = VolumePolicy{vid, reclaim (default retain), retention (default 0),
+  max_attachments (1, or 0 for a bucket), max_replicas, adopt, replica_of, access}`. It injects
+  `capabilities/storage/volumes: "true"` (or `capabilities/storage/buckets: "true"`) into the placement requirements.
+  No lifecycle or `vid` data ever enters `Storage.Attributes`.
+- A service-level `volume:` param compiles to `ResourceUnit.Volumes` on chain and `StorageParams.volume` in the
+  manifest -- identical content on both sides for the manifest check. A reference is `{external.owner or the signer,
+  external.dseq, gseq 1, name = the volume key}`; `external.dseq` is required.
 - Grammar enforcement: `volume:` excludes `size`/`class`/`attributes`; mount required; declared-but-unreferenced
-  volumes error; `count > 1` with an RWO ref rejected.
-- CLI (`chain-sdk/go/cli`; node `GetTxCmd` panics by design): `akash tx volume create -f volume.sdl
-  [--accept lowest-audited|manual] [--deposit ...]` (broadcast, stream bids, auto-accept per strategy; `--no-accept`
-  for manual); `akash tx volume close|migrate|adopt`; `akash query volume list|status --vid` (resolves the 0x13
-  index; shows lease state, attachment, runway from `EventAccountRunway`, retention deadline);
-  `akash volume promote --replica dseq` (close attach -> redeploy against the replica). Warn when `max-replicas: 0`.
+  volumes error; `count > 1` with an RWO reference rejected; one volume cannot be referenced by two services; services
+  sharing a profile need identical references; `adopt` and `replica-of` are mutually exclusive and need `dseq > 0`; a
+  bucket takes no `max-replicas` or `replica-of`; an `external` declaration carries no declaration fields (`size`,
+  `class`, `lifecycle`, `max-replicas`, `adopt`, `replica-of`, `access`). A file that both declares and references
+  volumes is rejected.
+- Fixtures: `testdata/sdl/input/v2.2/{volume-deployment,volume-attach,bucket-deployment}`.
+- TS: the schema-generated validator accepts 2.2; the TS manifest generator does not compile volumes yet (§9).
+- Tenant CLI (`chain-sdk/go/cli`; node `GetTxCmd` panics by design): `akash tx volume create [sdl-file]`
+  (`--dseq --owner --deposit --deposit-sources`) broadcasts the `MsgCreateDeployment` and warns on `retention: 0` and
+  on a disk with `max-replicas: 0`; `akash tx volume close` sends `MsgCloseDeployment`; `akash query volume list`
+  (`--owner --state --dseq`) and `akash query volume status` (`--owner --dseq`) show the deployment, its groups, the
+  escrow account, and the leases. A move is `akash tx market lease close` on the volume lease (the chain applies
+  `volume_migrate`). `akash tx market bid create` copies the order's volume policy into the bid; `akash tx deployment
+  create|update` pass the signer as the default reference owner.
+- Provider client (`go/provider/client`): `LeaseVolume` (`GET .../volume`), `BucketInfo`, `CreateBucketKey`,
+  `RevokeBucketKey`. JWT scopes `bucket` and `bucket-keys` (`go/util/jwt`, `specs/jwt-schema.json`, TS
+  `validateJwtPayload.ts`).
 
 ---
 
 ## 7. Upgrade Handler
 
-`node/upgrades/software/vX.Y.0/` (blank-imported in `upgrades.go`):
+`node/upgrades/software/v2.2.0/` in the reference implementation (registered in its `init.go`, blank-imported in
+`upgrades.go`); the release name is set when the upgrade is scheduled. The same upgrade carries lease resizing behind
+its own flag.
 
-- `RegisterMigration(deployment, 7 -> 8)` and `RegisterMigration(market, 8 -> 9)`: re-encode stores to
-  v1beta5/v2beta1 (nullable-additive => re-serialization only).
-- Seed params: `VolumeOrdersEnabled=false`, `MinVolumeReclamationWindow=24h`, `MaxVolumeSize`,
+- No store migrations: the new fields are additive on the active versions, every module keeps its
+  `ConsensusVersion`, and `StoreLoader` adds nothing.
+- Seed params where unset: `VolumeOrdersEnabled=false`, `MinVolumeReclamationWindow=24h`, `MaxVolumeSize=32Ti`,
   `MaxVolumeRetention=720h`, `MaxVolumeReplicas=4`.
-- Initialize the empty 0x13/0x15/0x16 indexes; genesis export/import included in the same release.
-- The escrow-hooks fix (1.3) rides the binary.
-- `StoreLoader{Added: nil}` -- no new store keys. ConsensusVersion bumps logged in CHANGELOG per convention.
-
-**Old-binary verification job (must pass, not asserted):** the network-upgrade CI job additionally runs the previous
-pinned provider release against the upgraded node and asserts no crash-loop, existing leases keep being served and
-withdrawn, and no bids are placed on v2beta1 orders.
+- Rebuild the `vid`, replica-count, and attachment indexes from state (empty on a network without volumes), as
+  `InitGenesis` does on import.
+- The escrow-hooks fix (1.3) rides the binary. CHANGELOG entries per convention.
 
 ---
 
 ## 8. Test Plan
 
-### 8.1 Fast, k8s-free (`node/tests/e2e`)
+### 8.1 Chain (`node/tests/e2e`, handler and keeper tests)
 
-Flag gating; storage-only validation shapes (present-but-zero, single group, single storage entry); vid
-uniqueness/adoption gates; colocation + CreateLease re-verify; attachment-index maintenance across every close path;
-cascade-detach on reclaim completion and on escrow exhaustion; reclamation-floor enforcement in both close directions;
-close-reason substitution; runway-event math; hooks fix + `keeper.go:310` masking regression (bid-account close
-byte-identical); grant-funded volume deployments (`AuthorizeDeposits`).
+`tests/e2e/storagemarket_test.go` (no build tag) with the `x/deployment` and `x/market` handler and keeper tests:
+flag gating; `vid` uniqueness and adoption gates; colocation and the `CreateLease` re-check; attachment-index
+maintenance across every close path; cascade-detach on reclaim completion and on escrow exhaustion; the reclamation
+floor in both close directions; close-reason substitution; runway-event math; the hooks fix and the `keeper.go:347`
+masking regression (bid-account close byte-identical); grant-funded volume deployments (`AuthorizeDeposits`); the
+bucket rules; genesis rebuild of the indexes. Storage-only shape validation (present-but-zero, single group, single
+storage entry) is tested in chain-sdk.
 
 ### 8.2 Provider e2e (`provider/integration/storagemarket_test.go`)
 
@@ -547,32 +828,52 @@ Registered in `TestIntegrationTestSuite`, modeled on `E2EPersistentStorageDefaul
 `rancher.io/local-path` class (`beta3-retain`) to `_docs/kustomize/storage/` plus the node-label append; Volume CRD +
 storage operator added to **both** `KUSTOMIZE_INSTALLS` and `RunLocalOperator` (divergence risk between the two is a
 known trap). Core loop: create volume -> bid -> lease -> attach compute -> write UUID -> close compute deployment ->
-PV re-parks, volume lease still active -> second compute deployment, same ref -> read UUID back.
+volume re-parks, volume lease still active -> second compute deployment, same ref -> read UUID back.
 
-Money paths (same harness): tiny-deposit exhaustion -> cascade-detach -> `volume_unfunded` -> CRD Retained ->
-adoption deployment -> gated bid -> re-bind -> re-attach -> UUID intact. Runway event asserted at each settle.
+Money path (same harness): tiny-deposit exhaustion -> cascade-detach -> `volume_unfunded` -> Volume `Retained` ->
+adoption deployment -> gated bid -> re-bind -> re-attach -> UUID intact.
 
-### 8.3 Two-Provider Migration
+### 8.3 Two-Provider Move
 
-Second `RunLocalProvider` (distinct ports/keys) against the same kind cluster: reclaim -> export (full-copy over
-`VolumeTransfer`, local-path driver) -> auto-re-order -> import -> re-attach at provider B -> UUID intact. **Honestly
-labeled:** local-path proves the coordination and transfer plumbing, not RBD; `rbd export-diff`/rbd-mirror is validated
-on a real two-cluster Rook pair via a manual `_run/` runbook, out-of-band, not hidden behind green CI.
+A second `RunLocalProvider` (distinct ports and keys) against the same kind cluster, which needs an identical-path
+kind mount: close the volume lease -> A `Exporting` -> A closes the lease at the deadline -> re-order -> B wins -> B
+`Importing` -> B pulls A's final copy -> `Provisioned` -> re-attach at B -> UUID intact. **Honestly labeled:**
+local-path proves the coordination and transfer plumbing, not RBD; the RBD path has no CI coverage yet.
 
-### 8.4 Upgrade CI
+### 8.4 Upgrade CI (to build before release)
 
-The semver upgrade directory exercises the U1 migrations and the old-provider-binary verification job automatically.
-Genesis export/import round-trips for the new indexes block release if missing.
+- The previous pinned provider release run against the upgraded node: no crash-loop, existing leases keep being
+  served and withdrawn, and no volume bid of its lands.
+- Test cases for the upgrade in `tests/upgrade/test-cases.json` and an upgrade worker.
 
 ### 8.5 Golden Files
 
-Canonical empty-manifest hash across client versions; SDL v2.2 -> GroupSpec compilation snapshots; v1beta4 -> v1beta5
-store re-serialization fixtures.
+The canonical empty-manifest hash (Go); SDL v2.2 -> GroupSpec compilation fixtures; TS/Go parity for v2.2 (the TS
+parity suite covers v2.0 and v2.1 today).
+
+---
+
+## 9. Implementation Status
+
+The reference implementation runs end to end on a local sandbox of three providers sharing one kind cluster: disks
+and buckets created, leased, and moved between providers; disks attached, detached, and re-attached; adoption after a
+close; and the provider e2e suites above. Not built yet:
+
+- **Replica sync.** `RunReplica` is never started, so a replica volume comes up empty; promote tooling.
+- **Large RBD moves.** RBD exports pass through a buffered exec in the tools pod and are held in memory, so big RBD
+  volumes cannot move yet; the RBD path has no CI coverage.
+- **The `rbd-mirror` driver.**
+- **Lookups.** A query service for `vid` and attachment lookups, and the CLI conveniences on top of it (`migrate`,
+  `adopt`, and `promote` commands, `--accept` strategies, `--vid` resolution).
+- **TS manifest generation** for volumes and buckets.
+- **The upgrade CI items in 8.4.**
+- **Inventory reporting:** `inventory.v1.StorageInfo` has no volume fields; the storage operator reports retained bytes
+  on its `/state` endpoint instead.
 
 ---
 
 ## Appendix A: Repo Hygiene (Phase 0, non-consensus)
 
-- Dedupe the double `E2EPersistentStorageDefault` registration (`provider/integration/e2e_test.go:752-753`).
-- Cap the SDL `GE(2.1.0)` version gate + schema lockstep (1.6) before shipping the v2.2 parser.
-- Regenerate the AEP index (`node scripts/index.js` in the AEP repo) after landing this spec.
+- The SDL `GE(2.1.0)` version gate is capped with the schema in lockstep (1.6), with a fixture rejecting 3.0.
+- The double `E2EPersistentStorageDefault` registration (`provider/integration/e2e_test.go`) is deduplicated.
+- Regenerate the AEP index (`node scripts/index.js` in the AEP repo) once this spec has its number.
