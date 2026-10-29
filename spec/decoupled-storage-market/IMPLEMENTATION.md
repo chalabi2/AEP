@@ -14,7 +14,7 @@ Reference implementation: branch `storage-market/active-versions` of
 [chalabi2/node](https://github.com/chalabi2/node/tree/storage-market/active-versions), and
 [chalabi2/provider](https://github.com/chalabi2/provider/tree/storage-market/active-versions), and branch
 `storage-market/core` of [chalabi2/helm-charts](https://github.com/chalabi2/helm-charts/tree/storage-market/core).
-These branches also carry lease resizing, which a separate AEP specifies and this document leaves out.
+These branches also carry lease resizing, which the In-Place Lease Resize AEP specifies and this document leaves out.
 
 ---
 

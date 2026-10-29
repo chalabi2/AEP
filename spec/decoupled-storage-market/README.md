@@ -116,7 +116,7 @@ A volume is a deployment with exactly one group whose group spec:
 Volume identity is the ordinary `(owner, dseq, gseq=1)` group identity. The durable data contract -- size, class, and
 `VolumePolicy{vid, reclaim, retention, max_attachments, max_replicas, access}` -- lives on the group record, set at
 creation and persisting across every order, bid, lease, and attachment, readable even after the group closes. Only
-the size can change afterwards, and only by growing through a lease resize, which a separate AEP specifies.
+the size can change afterwards, and only by growing through a lease resize, which the In-Place Lease Resize AEP specifies.
 
 `VolumePolicy` carries:
 
@@ -551,7 +551,7 @@ a parameter change.
 stream-export driver, moving disks and buckets between providers; replica sync; eviction runbooks; promote tooling;
 native mirroring as an opt-in driver.
 
-**Out of scope here.** Lease resizing, including growing a volume or bucket in place, is specified in a separate AEP.
+**Out of scope here.** Lease resizing, including growing a volume or bucket in place, is specified in the In-Place Lease Resize AEP.
 Future AEPs: multi-attach (read-write-many) classes, escrow grace, chain-attested replica consistency and
 auto-promotion, and a storage query service (`vid` and attachment lookups) if UX demands one -- the identity tuples
 chosen here let a future facade alias them without breaking anything.
@@ -607,7 +607,7 @@ chosen here let a future facade alias them without breaking anything.
 
 ## Limitations
 
-- **Resize is specified separately.** Growing a volume or bucket in place is part of the lease resize AEP.
+- **Resize is specified separately.** Growing a volume or bucket in place is part of the In-Place Lease Resize AEP.
 - **Moves depend on retention and copy the whole volume.** The copy runs after the source lease closes, inside its
   retention window; a volume with no retention cannot move, and the workload is down from the close until the copy
   lands.
